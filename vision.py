@@ -255,8 +255,8 @@ def detect_circles(frame, hole_region, active_region):
     blurred = cv2.GaussianBlur(combined, (9, 9), 2)
     circles = cv2.HoughCircles(
         blurred, cv2.HOUGH_GRADIENT,
-        dp=1.2, minDist=10,
-        param1=50, param2=5,
+        dp=1.2, minDist=12,
+        param1=50, param2=7,
         minRadius=5, maxRadius=10,
     )
     detections = []
