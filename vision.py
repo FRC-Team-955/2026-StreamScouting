@@ -14,6 +14,7 @@ from config import (
     SCORE_MIN_INSIDE_POINTS,
     SCORE_POLYGON_REF_BY_SIDE,
     SCORE_TRAIL_WINDOW,
+    PARABOLA_A_MIN
 )
 
 
@@ -205,6 +206,9 @@ def fit_parabola(points):
         r2 = float(1.0 - np.divide(ss_res, ss_tot))
     else:
         r2 = 0.0
+
+    if a<PARABOLA_A_MIN:
+        r2=0 # scuffed method
     return a, b, c, r2
 
 
