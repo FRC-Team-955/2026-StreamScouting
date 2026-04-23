@@ -7,16 +7,11 @@ import cv2
 import numpy as np
 
 from config import (
-    BOUNCE_OUT_RISE,
     FRAME_SKIP,
-    END_SECONDS,
     MAX_TRAIL,
-    PARABOLA_A_MIN,
     PARABOLA_MIN_POINTS,
     PARABOLA_R2_MIN,
     SCORE_COOLDOWN_FRAMES,
-    SCORE_MIN_DESCENT,
-    SCORE_MIN_INSIDE_POINTS,
     SKIP_SECONDS,
     TRAIL_DECAY,
 )
@@ -32,17 +27,7 @@ from vision import (
 )
 
 
-def run(
-    video_path,
-    side,
-    frame_skip=FRAME_SKIP,
-    start_seconds=None,
-    score_min_descent=SCORE_MIN_DESCENT,
-    score_min_inside_points=SCORE_MIN_INSIDE_POINTS,
-    bounce_out_rise=BOUNCE_OUT_RISE,
-    parabola_r2_min=PARABOLA_R2_MIN,
-    headless=False,
-):
+def run(video_path, side, frame_skip=FRAME_SKIP):
     cap = cv2.VideoCapture(video_path)
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -53,13 +38,6 @@ def run(
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     skip_frames = int(SKIP_SECONDS * fps)
-    end_frames = None
-
-    if start_seconds is not None:
-        start_frames = int(start_seconds * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frames)
-        if END_SECONDS is not None:
-            end_frames = int(END_SECONDS * fps)
 
     print(
         f"[regions] src={frame_w}x{frame_h} crop={crop_region} "
@@ -82,7 +60,7 @@ def run(
     display_fps  = 0.0
     last_fps_update = time.time()
 
-    frame_idx = int(start_seconds * fps) if start_seconds is not None else 0
+    frame_idx = 0
 
     while True:
         # grab() seeks without decoding, much faster than read() for skipped frames
@@ -94,9 +72,6 @@ def run(
         if not ret:
             break
         frame_idx += 1
-
-        if end_frames is not None and frame_idx >= end_frames:
-            break
 
         if frame_idx < skip_frames:
             continue
@@ -142,9 +117,6 @@ def run(
                     score_polygon,
                     scored_track_ids,
                     track_lost=track_lost,
-                    score_min_descent=score_min_descent,
-                    score_min_inside_points=score_min_inside_points,
-                    bounce_out_rise=bounce_out_rise,
             ):
                 score += 1
                 last_score_frame_per_id[oid] = frame_idx
@@ -175,16 +147,12 @@ def run(
 
         for oid, pts in trails.items():
             if len(pts) >= PARABOLA_MIN_POINTS:
-                result = fit_parabola(
-                    pts,
-                    parabola_min_points=PARABOLA_MIN_POINTS,
-                    parabola_a_min=PARABOLA_A_MIN,
-                )
+                result = fit_parabola(pts)
                 if result:
                     a, b, c, r2 = result
                     xs     = np.array([p[0] for p in pts])
                     x_mean = xs.mean()
-                    col    = (0, 200, 255) if r2 > parabola_r2_min else (80, 80, 80)
+                    col    = (0, 200, 255) if r2 > PARABOLA_R2_MIN else (80, 80, 80)
                     for xi in range(int(xs.min()), int(xs.max()), 2):
                         xn  = xi - x_mean
                         yi  = int(a * xn**2 + b * xn + c)
@@ -235,10 +203,9 @@ def run(
                     (460, 58),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
 
-        if not headless:
-            cv2.imshow("tracking", vis)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
+        cv2.imshow("tracking", vis)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
 
     cap.release()
     cv2.destroyAllWindows()
@@ -250,12 +217,6 @@ if __name__ == "__main__":
     parser.add_argument("--side", type=str, choices=["red", "blue"], default="red")
     parser.add_argument("--frame-drop", type=int)
     parser.add_argument("--video-file", type=str)
-    parser.add_argument("--start", type=float)
-    parser.add_argument("--score-min-descent", type=int, default=SCORE_MIN_DESCENT)
-    parser.add_argument("--score-min-inside-points", type=int, default=SCORE_MIN_INSIDE_POINTS)
-    parser.add_argument("--bounce-out-rise", type=int, default=BOUNCE_OUT_RISE)
-    parser.add_argument("--parabola-r2-min", type=float, default=PARABOLA_R2_MIN)
-    parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
 
     cv2.setNumThreads(os.cpu_count() or 1)
@@ -263,15 +224,5 @@ if __name__ == "__main__":
     frame_skip = args.frame_drop if args.frame_drop is not None else FRAME_SKIP
 
     print("Initializing...")
-    sc = run(
-        args.video_file,
-        args.side,
-        frame_skip=frame_skip,
-        start_seconds=args.start,
-        score_min_descent=args.score_min_descent,
-        score_min_inside_points=args.score_min_inside_points,
-        bounce_out_rise=args.bounce_out_rise,
-        parabola_r2_min=args.parabola_r2_min,
-        headless=args.headless,
-    )
+    sc = run(args.video_file, args.side, frame_skip=frame_skip)
     print(f"Final score: {sc}")
