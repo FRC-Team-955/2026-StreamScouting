@@ -38,15 +38,15 @@ try:
         ROBOT_YOLO_IMGSZ,
     )
 except ImportError:
-    ROBOT_MAX_DIST          = 60     # px — max centroid jump per frame for a match
+    ROBOT_MAX_DIST          = 120    # px — YOLO boxes jump more than circle detections
     ROBOT_GHOST_FRAMES      = 12     # frames without detection before track goes dormant
     ROBOT_DORMANT_FRAMES    = 60     # frames to keep dormant track before hard-delete
     ROBOT_REIDENTIFY_DIST   = 120    # px — dormant track search radius for re-ID
     ROBOT_MAX_TRAIL         = 60     # centroid history length
     ROBOT_PROCESS_NOISE     = 5e-2   # Kalman Q scalar
-    ROBOT_MEASUREMENT_NOISE = 5e-1   # Kalman R scalar
+    ROBOT_MEASUREMENT_NOISE = 0.5   # Kalman R scalar
     # ---- YOLO ----
-    ROBOT_YOLO_MODEL   = "yolov8n.pt"  # path to weights; downloads automatically on first run
+    ROBOT_YOLO_MODEL   = "yolov8x.pt"  # model. SWAP TO yolov8n if your laptop is a potato
     ROBOT_YOLO_CONF    = 0.25          # detection confidence threshold
     ROBOT_YOLO_CLASSES = None          # None = all classes; [0] = person only, etc.
     ROBOT_YOLO_IMGSZ   = 640           # inference resolution (px)
@@ -101,7 +101,6 @@ def detect_robots(
 
     for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        # clamp to frame
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_frame, x2), min(h_frame, y2)
         if x2 <= x1 or y2 <= y1:
@@ -109,6 +108,18 @@ def detect_robots(
 
         w = x2 - x1
         h = y2 - y1
+
+        # ---- shape filter: reject people and other tall thin objects ----
+        # FRC robots from a broadcast overhead angle are roughly square or
+        # wider-than-tall. People are tall and narrow (aspect > 1.8).
+        aspect = h / max(w, 1)
+        if aspect > 1.6:          # too tall/thin → likely a person
+            continue
+        if w < 20 or h < 15:      # too small → noise
+            continue
+        if w > w_frame * 0.4:     # too wide → probably a merged background blob
+            continue
+
         cx = x1 + w // 2
         cy = y1 + h // 2
 
@@ -219,13 +230,16 @@ class RobotTrack:
         pred = self.kf.predict()
         return int(pred[0]), int(pred[1])
 
-    def update(self, cx: int, cy: int, w: int, h: int) -> None:
+    def update(self, cx: int, cy: int, w: int, h: int, alliance: str = "unknown") -> None:
         self.kf.correct(np.array([[cx], [cy]], dtype=np.float32))
-        self.ghost_count  = 0
+        self.ghost_count   = 0
         self.dormant_count = 0
-        self.is_dormant   = False
-        self.w, self.h    = w, h
+        self.is_dormant    = False
+        self.w, self.h     = w, h
         self.trail.append((cx, cy))
+        # Only upgrade alliance, never downgrade back to unknown
+        if self.alliance == "unknown" and alliance != "unknown":
+            self.alliance = alliance
 
     def position(self) -> Tuple[int, int]:
         s = self.kf.statePost
@@ -308,7 +322,7 @@ class RobotTracker:
         matched_trk_ids = set()
         for di, tid in zip(matched_det, matched_trk):
             cx, cy, w, h, alliance = detections[di]
-            self.tracks[tid].update(cx, cy, w, h)
+            self.tracks[tid].update(cx, cy, w, h, alliance)
             matched_trk_ids.add(tid)
 
         # Step 4: handle unmatched detections — try re-ID, else spawn
@@ -317,11 +331,10 @@ class RobotTracker:
             cx, cy, w, h, alliance = detections[di]
             dormant_id = self._try_reidentify(cx, cy)
             if dormant_id is not None:
-                # Resurrect dormant track
                 track = self.dormant.pop(dormant_id)
                 track.kf.statePost[0] = cx
                 track.kf.statePost[1] = cy
-                track.update(cx, cy, w, h)
+                track.update(cx, cy, w, h, alliance)
                 self.tracks[dormant_id] = track
                 matched_trk_ids.add(dormant_id)
             else:
