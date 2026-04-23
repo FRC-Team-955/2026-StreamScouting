@@ -90,7 +90,7 @@ def trail_hits_polygon(points, polygon):
     return False
 
 
-def trail_bounced_out_of_polygon(recent_pts, inside_flags):
+def trail_bounced_out_of_polygon(recent_pts, inside_flags, bounce_out_rise):
     if not any(inside_flags):
         return False
 
@@ -101,7 +101,7 @@ def trail_bounced_out_of_polygon(recent_pts, inside_flags):
 
     deepest_y = max(p[1] for p in post_entry_pts)
     latest_y = post_entry_pts[-1][1]
-    return latest_y + BOUNCE_OUT_RISE < deepest_y
+    return latest_y + bounce_out_rise < deepest_y
 
 
 def scale_region(region, sx, sy):
@@ -187,8 +187,8 @@ def is_approximately_yellow(point, frame):
 
 
 # PARABOLIC CHECK
-def fit_parabola(points):
-    if len(points) < PARABOLA_MIN_POINTS:
+def fit_parabola(points, parabola_min_points=PARABOLA_MIN_POINTS, parabola_a_min=PARABOLA_A_MIN):
+    if len(points) < parabola_min_points:
         return None
     xs = np.array([p[0] for p in points], dtype=float)
     ys = np.array([p[1] for p in points], dtype=float)
@@ -207,12 +207,25 @@ def fit_parabola(points):
     else:
         r2 = 0.0
 
-    if a<PARABOLA_A_MIN:
+    if a < parabola_a_min:
         r2=0 # scuffed method
     return a, b, c, r2
 
 
-def check_parabola_score(oid, pts, frame_idx, last_score_frame_per_id, last_score_frame, score_polygon, scored_track_ids, track_lost=False):
+def check_parabola_score(
+    oid,
+    pts,
+    frame_idx,
+    last_score_frame_per_id,
+    last_score_frame,
+    score_polygon,
+    scored_track_ids,
+    track_lost=False,
+    score_trail_window=SCORE_TRAIL_WINDOW,
+    score_min_descent=SCORE_MIN_DESCENT,
+    score_min_inside_points=SCORE_MIN_INSIDE_POINTS,
+    bounce_out_rise=BOUNCE_OUT_RISE,
+):
     # cheapest checks first so we bail before doing any polygon math
     if oid in scored_track_ids or len(pts) < 2:
         return False
@@ -223,18 +236,18 @@ def check_parabola_score(oid, pts, frame_idx, last_score_frame_per_id, last_scor
     if (frame_idx - last_score_frame) <= SCORE_COOLDOWN_FRAMES:
         return False
 
-    recent_pts = pts[-SCORE_TRAIL_WINDOW:]
+    recent_pts = pts[-score_trail_window:]
 
     # compute inside_flags once, reuse for stable_inside and bounce check
     inside_flags = [point_in_polygon(point, score_polygon) for point in recent_pts]
 
-    descending   = recent_pts[-1][1] >= recent_pts[max(0, len(recent_pts) - 3)][1] + SCORE_MIN_DESCENT
-    stable_inside = inside_flags[-1] and sum(inside_flags[-SCORE_MIN_INSIDE_POINTS:]) >= SCORE_MIN_INSIDE_POINTS
+    descending   = recent_pts[-1][1] >= recent_pts[max(0, len(recent_pts) - 3)][1] + score_min_descent
+    stable_inside = inside_flags[-1] and sum(inside_flags[-score_min_inside_points:]) >= score_min_inside_points
     hit_bucket   = trail_hits_polygon(recent_pts, score_polygon)
 
     if not descending or not stable_inside or not hit_bucket:
         return False
-    if trail_bounced_out_of_polygon(recent_pts, inside_flags):
+    if trail_bounced_out_of_polygon(recent_pts, inside_flags, bounce_out_rise):
         return False
 
     return True

@@ -1,4 +1,5 @@
-SKIP_SECONDS    = 4  #62
+SKIP_SECONDS    = 5  #62
+END_SECONDS     = 27  # set to a number of seconds to stop the video early while testing
 MAX_DIST        = 60
 
 # Regions are tuned against this source resolution and scaled per input video.
