@@ -1,4 +1,4 @@
-SKIP_SECONDS    = 4  #62
+SKIP_SECONDS    = 16  #62 4
 MAX_DIST        = 60
 
 # Regions are tuned against this source resolution and scaled per input video.
