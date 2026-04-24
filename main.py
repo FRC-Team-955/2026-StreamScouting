@@ -14,6 +14,7 @@ from config import (
     SCORE_COOLDOWN_FRAMES,
     SKIP_SECONDS,
     TRAIL_DECAY,
+    SCORE_POLYGON_REF_BY_SIDE,
 )
 from tracker import Tracker
 from vision import (
@@ -26,6 +27,106 @@ from vision import (
     fit_parabola,
     get_runtime_regions,
 )
+
+
+def get_frame_at_index(cap, frame_idx):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    return frame if ret else None
+
+
+def polygon_center(polygon):
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    return (np.mean(xs), np.mean(ys))
+
+
+def adjust_polygon_for_apriltag(video_path, side, frame_240_offset=None):
+    if frame_240_offset is None:
+        try:
+            ref_cap = cv2.VideoCapture("Q18.mp4")
+            ref_frame = get_frame_at_index(ref_cap, 240)
+            ref_cap.release()
+
+            if ref_frame is not None:
+                apriltags = detect_apriltags(ref_frame)
+                tag11_ref = [tag for tag in apriltags if tag.get("id") == 11]
+
+                if tag11_ref:
+                    ref_frame_h, ref_frame_w = ref_frame.shape[:2]
+                    crop_region, _, _, _ = get_runtime_regions(ref_frame_w, ref_frame_h, side)
+                    crop_x1, crop_y1, crop_x2, crop_y2 = crop_region
+
+                    tag11_center = tag11_ref[0]["center"]
+                    tag11_in_crop = (tag11_center[0] - crop_x1, tag11_center[1] - crop_y1)
+
+                    ref_polygon = SCORE_POLYGON_REF_BY_SIDE[side]
+                    _, _, ref_score_polygon, _ = get_runtime_regions(ref_frame_w, ref_frame_h, side)
+                    runtime_center = polygon_center(ref_score_polygon)
+
+                    frame_240_offset = (
+                        runtime_center[0] - tag11_in_crop[0],
+                        runtime_center[1] - tag11_in_crop[1]
+                    )
+                    print(f"[AprilTag] Reference offset from Q18.mp4: {frame_240_offset}")
+        except Exception as e:
+            print(f"[AprilTag] Could not calculate reference offset: {e}")
+            return None
+
+    if frame_240_offset is None:
+        return None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        frame = get_frame_at_index(cap, 240)
+        cap.release()
+
+        if frame is None:
+            print("[AprilTag] Could not read frame 240 from video")
+            return None
+
+        apriltags = detect_apriltags(frame)
+        tag11_detections = [tag for tag in apriltags if tag.get("id") == 11]
+
+        if not tag11_detections:
+            print("[AprilTag] AprilTag 11 not found at frame 240")
+            return None
+
+        frame_h, frame_w = frame.shape[:2]
+        crop_region, hole_region, score_polygon, active_region = get_runtime_regions(frame_w, frame_h, side)
+        crop_x1, crop_y1, crop_x2, crop_y2 = crop_region
+
+        tag11_center = tag11_detections[0]["center"]
+        tag11_in_crop = (tag11_center[0] - crop_x1, tag11_center[1] - crop_y1)
+        target_polygon_center = (
+            tag11_in_crop[0] + frame_240_offset[0],
+            tag11_in_crop[1] + frame_240_offset[1]
+        )
+
+        current_center = polygon_center(score_polygon)
+        translation = (
+            target_polygon_center[0] - current_center[0],
+            target_polygon_center[1] - current_center[1]
+        )
+
+        ref_polygon = SCORE_POLYGON_REF_BY_SIDE[side]
+        ref_w, ref_h = 1366, 768
+        sx = frame_w / ref_w
+        sy = frame_h / ref_h
+
+        adjusted_polygon = [
+            (int(x * sx + translation[0]), int(y * sy + translation[1]))
+            for x, y in ref_polygon
+        ]
+
+        print(f"[AprilTag] Found AprilTag 11 at frame 240 center: {tag11_center}")
+        print(f"[AprilTag] Adjusted polygon by translation: ({translation[0]:.1f}, {translation[1]:.1f})")
+
+        return adjusted_polygon
+
+    except Exception as e:
+        print(f"[AprilTag] Error adjusting polygon: {e}")
+        return None
 
 
 def run(video_path, side, frame_skip=FRAME_SKIP):
@@ -62,7 +163,6 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
     last_fps_update = time.time()
 
     frame_idx = 0
-    apriltag_checked = False
 
     while True:
         # grab() seeks without decoding, much faster than read() for skipped frames
@@ -177,19 +277,19 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
             cv2.putText(vis, str(oid), (x + 5, y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # draw launch point markers for scored shots, persists for the rest of the video
-        for oid, (ox, oy) in origins.items():
-            arm, gap = 8, 3
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                cv2.line(
-                    vis,
-                    (ox + dx * gap,         oy + dy * gap),
-                    (ox + dx * (arm + gap), oy + dy * (arm + gap)),
-                    (0, 200, 255), 2, cv2.LINE_AA,
-                )
-            cv2.circle(vis, (ox, oy), 3, (0, 200, 255), -1, cv2.LINE_AA)
-            cv2.putText(vis, f"#{oid}", (ox + arm + gap + 2, oy + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1, cv2.LINE_AA)
+        # # draw launch point markers for scored shots, persists for the rest of the video
+        # for oid, (ox, oy) in origins.items():
+        #     arm, gap = 8, 3
+        #     for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        #         cv2.line(
+        #             vis,
+        #             (ox + dx * gap,         oy + dy * gap),
+        #             (ox + dx * (arm + gap), oy + dy * (arm + gap)),
+        #             (0, 200, 255), 2, cv2.LINE_AA,
+        #         )
+        #     cv2.circle(vis, (ox, oy), 3, (0, 200, 255), -1, cv2.LINE_AA)
+        #     cv2.putText(vis, f"#{oid}", (ox + arm + gap + 2, oy + 4),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1, cv2.LINE_AA)
 
         t_end = time.perf_counter()
         frame_times.append(t_end - t_start)
@@ -206,15 +306,6 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                     (460, 58),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
 
-        if not apriltag_checked and frame_idx == 240:
-            apriltags = [tag for tag in detect_apriltags(full_frame) if tag.get("id") == 11]
-            apriltag_checked = True
-            if apriltags:
-                print(f"[apriltag] frame 240 found tag 11 ({len(apriltags)} detection(s))")
-                cv2.putText(vis, "AprilTag 11 found", (460, 86),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 1)
-            else:
-                print("[apriltag] frame 240 tag 11 not found")
 
         cv2.imshow("tracking", vis)
         if cv2.waitKey(1) & 0xFF == 27:
