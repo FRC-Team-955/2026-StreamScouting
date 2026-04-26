@@ -59,7 +59,7 @@ def infer(frame):
 
     raw = []
     for result, (x0, y0, _, _) in zip(
-        model(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False), tiles_coords   # single batched GPU call
+        model(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=True), tiles_coords   # single batched GPU call
     ):
         if result.boxes is None: continue # tile had zero detections
         for box, conf, cls in zip(
