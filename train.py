@@ -5,9 +5,9 @@ def main():
     model.train(
     data="dataset2/data.yaml",
     epochs=100,
-    device=0,
+    device=None,
     workers=8,
-    batch=6,
+    batch=-1,
     imgsz=1280,
 
     # augmentations
