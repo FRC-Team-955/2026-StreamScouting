@@ -10,7 +10,7 @@ from config import (
     FRAME_SKIP,
     MAX_TRAIL,
     PARABOLA_MIN_POINTS,
-    PARABOLA_R2_MIN,
+    PARABOLA_FIT_ERROR,
     SCORE_COOLDOWN_FRAMES,
     SKIP_SECONDS,
     TRAIL_DECAY,
@@ -258,7 +258,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                 print(f"[fit] oid={oid} err={err:.4f} a={a:.4f} b={b:.4f} c={c:.4f} theta={np.degrees(theta):.1f}° pts={len(pts)}")
                 print(f"      xs={int(xs.min())}..{int(xs.max())}  ys={int(ys.min())}..{int(ys.max())}")
 
-                col = (0, 200, 255) if err < PARABOLA_R2_MIN else (80, 80, 80)
+                col = (0, 200, 255) if err < PARABOLA_FIT_ERROR else (80, 80, 80)
                 h, w = vis.shape[:2]
 
                 any_drawn = 0
