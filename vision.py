@@ -20,6 +20,21 @@ from config import (
 
 )
 
+_hough_detector = None
+
+def _get_hough_detector():
+    global _hough_detector
+    if _hough_detector is None:
+        _hough_detector = cv2.cuda.createHoughCirclesDetector(
+            dp=1.2,
+            minDist=15.3,
+            cannyThreshold=50,
+            votesThreshold=7,
+            minRadius=5,
+            maxRadius=10,
+        )
+    return _hough_detector
+
 
 def in_region(point, region):
     x, y = point
@@ -359,30 +374,33 @@ def detect_circles(frame, hole_region, active_region):
     if roi.size == 0:
         return []
 
+    # CPU:
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     mask = (
-            cv2.inRange(hsv, (20, 120, 120), (40, 255, 255)) |
-            cv2.inRange(hsv, (90, 120, 80), (130, 255, 255)) |
-            cv2.inRange(hsv, (0, 120, 80), (10, 255, 255)) |
-            cv2.inRange(hsv, (170, 120, 80), (180, 255, 255))
+        cv2.inRange(hsv, (20, 120, 120), (40, 255, 255)) |
+        cv2.inRange(hsv, (90, 120, 80),  (130, 255, 255)) |
+        cv2.inRange(hsv, (0,  120, 80),  (10,  255, 255)) |
+        cv2.inRange(hsv, (170,120, 80),  (180, 255, 255))
     )
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (9, 9), 2)
-    edges = cv2.Canny(gray, 50, 150)
+    gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray    = cv2.GaussianBlur(gray, (9, 9), 2)
+    edges   = cv2.Canny(gray, 50, 150)
     combined = cv2.bitwise_or(edges, mask)
-    blurred = cv2.GaussianBlur(combined, (9, 9), 2)
-    circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT,
-        dp=1.2, minDist=15.3,
-        param1=50, param2=7,
-        minRadius=5, maxRadius=10,
-    )
+    blurred  = cv2.GaussianBlur(combined, (9, 9), 2)
+
+
+    gpu_mat = cv2.cuda_GpuMat()
+    gpu_mat.upload(blurred)
+    gpu_circles = _get_hough_detector().detect(gpu_mat)
+
     detections = []
-    if circles is not None:
-        for (x, y, r) in np.round(circles[0, :]).astype("int"):
-            gx, gy = x + ax1, y + ay1
-            if not in_region((gx, gy), hole_region) and is_approximately_yellow((gx, gy), frame):
-                detections.append((gx, gy, r))
+    if gpu_circles is not None:
+        circles = gpu_circles.download()
+        if circles is not None and circles.size > 0:
+            for (x, y, r) in np.round(circles[0, :]).astype("int"):
+                gx, gy = x + ax1, y + ay1
+                if not in_region((gx, gy), hole_region) and is_approximately_yellow((gx, gy), frame):
+                    detections.append((gx, gy, r))
     return detections
 
 

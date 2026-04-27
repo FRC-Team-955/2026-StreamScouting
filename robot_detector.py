@@ -82,12 +82,15 @@ def _passes_shape(gx1, gy1, gx2, gy2) -> bool:
     return True
 
 
-
+_detect_counter = 0
+_detect_cache = []
+DETECT_EVERY_N_FRAMES = 3
 
 def detect(frame: np.ndarray) -> list:
-
-    #Run tiled inference on frame
-    #Returns a list of [x1, y1, x2, y2, conf, cls] after NMS.
+    global _detect_counter, _detect_cache
+    _detect_counter += 1
+    if _detect_counter % DETECT_EVERY_N_FRAMES != 0:
+        return _detect_cache
 
     h, w = frame.shape[:2]
     tiles_coords = _generate_tiles(w, h)
@@ -95,7 +98,7 @@ def detect(frame: np.ndarray) -> list:
 
     raw = []
     for result, (x0, y0, _, _) in zip(
-        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=True),
+        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=False),
         tiles_coords,
     ):
         if result.boxes is None:
@@ -109,4 +112,5 @@ def detect(frame: np.ndarray) -> list:
             if _passes_shape(gx1, gy1, gx2, gy2):
                 raw.append([gx1, gy1, gx2, gy2, float(conf), int(cls)])
 
-    return _nms(raw, NMS_IOU)
+    _detect_cache = _nms(raw, NMS_IOU)
+    return _detect_cache
