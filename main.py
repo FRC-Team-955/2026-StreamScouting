@@ -151,6 +151,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
     tracker    = Tracker()
     trails     = defaultdict(list)
     t_alphas   = defaultdict(list)
+    full_trails = defaultdict(list)  # unbounded, no decay — used for scored snapshots
     first_seen = {}
     origins    = {}
     fit_cache  = {}  # oid -> (trail_len, params, err, x_min, x_max)
@@ -210,9 +211,15 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                     first_seen[oid] = (x, y)
                 trails[oid].append((x, y))
                 t_alphas[oid].append(1.0)
+                full_trails[oid].append((x, y))
                 if len(trails[oid]) > MAX_TRAIL:
                     trails[oid].pop(0)
                     t_alphas[oid].pop(0)
+
+        # Re-identification: tracker resurrected a dead ID — full_trail is
+        # already on the right key so nothing extra needed; but if a *new*
+        # id was about to be created and we merged it back, the trail is
+        # already continuous. No-op here; the tracker handles it in-place.
 
         for oid in list(t_alphas.keys()):
             t_alphas[oid] = [a * TRAIL_DECAY for a in t_alphas[oid]]
@@ -241,26 +248,57 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                 if oid not in origins and oid in first_seen:
                     origins[oid] = first_seen[oid]
 
-                # Snapshot a permanently drawn curve fitted to the arc *before*
-                # the ball entered the bucket — just trim the last few points
-                # where it's dropping into the hole.
                 if oid not in scored_curves:
-                    TAIL_TRIM = 3
-                    trim = list(pts)[:-TAIL_TRIM] if len(pts) > TAIL_TRIM + PARABOLA_MIN_POINTS else list(pts)
-                    trail_snap = list(pts)  # full trail for perma-draw
-                    cpts = []
-                    if len(trim) >= PARABOLA_MIN_POINTS:
-                        _xs = np.array([p[0] for p in trim], dtype=float)
-                        _ys = np.array([p[1] for p in trim], dtype=float)
-                        if max(_xs.max() - _xs.min(), _ys.max() - _ys.min()) >= 20:
-                            _params, _err = fit_conic(_xs, _ys)
-                            _vis_h, _vis_w = frame.shape[:2]
-                            _cpts = sample_conic_curve(_params, _xs, _ys, _vis_w, _vis_h)
-                            if len(_cpts) >= 5:
-                                cpts = _cpts
-                    scored_curves[oid] = (trail_snap, cpts)
+                    trail_snap = list(full_trails[oid])
+                    scored_curves[oid] = (trail_snap, [])
 
                 print(f"  [SCORE]  ID {oid} @ frame {frame_idx} -> total: {score}")
+
+        # --- post-score trail stitching ---
+        # Try to merge any two scored trails where one's endpoint is close
+        # to another's start point, indicating a dropped re-id mid-flight.
+        STITCH_DIST = 20   # px — max gap to bridge
+        merged = True
+        while merged:
+            merged = False
+            keys = list(scored_curves.keys())
+            for i, ka in enumerate(keys):
+                if ka not in scored_curves:
+                    continue
+                trail_a, cpts_a = scored_curves[ka]
+                if not trail_a:
+                    continue
+                end_a = trail_a[-1]
+                for kb in keys[i+1:]:
+                    if kb not in scored_curves:
+                        continue
+                    trail_b, cpts_b = scored_curves[kb]
+                    if not trail_b:
+                        continue
+                    start_b = trail_b[0]
+                    end_b   = trail_b[-1]
+                    start_a = trail_a[0]
+
+                    # Check a→b (end of a connects to start of b)
+                    d_ab = ((end_a[0]-start_b[0])**2 + (end_a[1]-start_b[1])**2)**0.5
+                    # Check b→a (end of b connects to start of a)
+                    d_ba = ((end_b[0]-start_a[0])**2 + (end_b[1]-start_a[1])**2)**0.5
+
+                    if d_ab <= STITCH_DIST or d_ba <= STITCH_DIST:
+                        if d_ab <= d_ba:
+                            merged_trail = trail_a + trail_b
+                        else:
+                            merged_trail = trail_b + trail_a
+                        # keep the lower id, drop the higher
+                        keep, drop = (ka, kb) if ka < kb else (kb, ka)
+                        scored_curves[keep] = (merged_trail, [])
+                        del scored_curves[drop]
+                        # re-number is handled by enumerate at draw time
+                        merged = True
+                        print(f"  [STITCH] merged scored trails {ka} + {kb}")
+                        break
+                if merged:
+                    break
         t_score = time.perf_counter()
 
         vis = frame.copy()
