@@ -152,6 +152,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
     t_alphas   = defaultdict(list)
     first_seen = {}
     origins    = {}
+    fit_cache  = {}  # oid -> (trail_len, params, err, x_min, x_max)
 
     score                   = 0
     last_score_frame        = -SCORE_COOLDOWN_FRAMES
@@ -221,6 +222,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
             else:
                 trails.pop(oid, None)
                 t_alphas.pop(oid, None)
+                fit_cache.pop(oid, None)
 
         for oid, pts in trails.items():
             track      = tracker.tracks.get(oid)
@@ -254,25 +256,42 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                 color = (0, int(255 * a), int(255 * (1 - a)))
                 cv2.line(vis, pts[i - 1], pts[i], color, 2)
 
+        vis_h = vis.shape[0]
         for oid, pts in trails.items():
             if len(pts) >= PARABOLA_MIN_POINTS:
-                xs = np.array([p[0] for p in pts])
-                ys = np.array([p[1] for p in pts])
-                params, err = fit_conic(xs, ys)
-                a, b, c, theta = params
-                print(f"[fit] oid={oid} err={err:.4f} a={a:.4f} b={b:.4f} c={c:.4f} theta={np.degrees(theta):.1f}° pts={len(pts)}")
-                print(f"      xs={int(xs.min())}..{int(xs.max())}  ys={int(ys.min())}..{int(ys.max())}")
+                trail_len = len(pts)
+                if oid not in fit_cache or fit_cache[oid][0] != trail_len:
+                    xs = np.array([p[0] for p in pts])
+                    ys = np.array([p[1] for p in pts])
+                    params, err = fit_conic(xs, ys)
+                    a, b, c, theta = params
 
-                col   = (0, 200, 255) if err < PARABOLA_FIT_ERROR else (80, 80, 80)
-                vis_h = vis.shape[0]
-                for xi in range(int(xs.min()), int(xs.max()), 2):
-                    sol = solve_y(a, b, c, theta, float(xi))
-                    if sol is None:
-                        continue
-                    for yi_f in sol:
-                        yi = int(round(yi_f))
-                        if 0 <= yi < vis_h:
-                            cv2.circle(vis, (xi, yi), 1, col, -1)
+                    # cache curve points too
+                    curve_pts = []
+                    for xi in range(int(xs.min()), int(xs.max()), 2):
+                        sol = solve_y(a, b, c, theta, float(xi))
+                        if sol is None:
+                            continue
+                        for yi_f in sol:
+                            yi = int(round(yi_f))
+                            if 0 <= yi < vis_h:
+                                curve_pts.append((xi, yi))
+
+                    fit_cache[oid] = (
+                        trail_len, params, err,
+                        float(xs.min()), float(xs.max()),
+                        curve_pts,
+                    )
+                    print(
+                        f"[fit] oid={oid} err={err:.4f} a={a:.4f} b={b:.4f} "
+                        f"c={c:.4f} theta={np.degrees(theta):.1f}° pts={trail_len} "
+                        f"xs={int(xs.min())}..{int(xs.max())} ys={int(ys.min())}..{int(ys.max())}"
+                    )
+
+                _, params, err, x_min, x_max, curve_pts = fit_cache[oid]
+                col = (0, 200, 255) if err < PARABOLA_FIT_ERROR else (80, 80, 80)
+                if curve_pts:
+                    cv2.polylines(vis, [np.array(curve_pts, dtype=np.int32)], False, col, 1, cv2.LINE_AA)
 
         for tid, track in tracker.tracks.items():
             if track.ghost_count > 0:
@@ -297,7 +316,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
             last_fps_update = now
 
         print(
-            f"crop={t_crop-t_start:.3f} "
+            f"[time] crop={t_crop-t_start:.3f} "
             f"circles={t_circles-t_crop:.3f} "
             f"track={t_track-t_circles:.3f} "
             f"robots={t_robots-t_track:.3f} "
