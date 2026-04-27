@@ -7,12 +7,12 @@ MODEL_PATH    = "YOLOv8n-6k-variated.pt"
 VIDEO_PATH    = "Q18.mp4"
 OUTPUT_PATH   = "test.avi"
 TILE_SIZE     = 640                    # training res
-OVERLAP       = 0.65                   # fraction of tile_size that adjacent tiles share
-CONF_THRESH   = 0.15                   # minimum confidence for a detection
-MAX_BOX_AREA  = 640 * 640 * 0.06       # max allowed box area in pixels
+OVERLAP       = 0.45                   # fraction of tile_size that adjacent tiles share
+CONF_THRESH   = 0.6                    # minimum confidence for a detection
+MAX_BOX_AREA  = 480 * 480 * 0.06       # max allowed box area in pixels
 DISPLAY_SCALE = 0.5                    # resize factor for the preview window only
 
-SAVE_OUT      = True
+SAVE_OUT      = False
 
 model = YOLO(MODEL_PATH)
 
@@ -71,7 +71,7 @@ def infer(frame):
             if (gx2-gx1) * (gy2-gy1) > MAX_BOX_AREA: continue  # reject oversized boxes
             raw.append([gx1, gy1, gx2, gy2, conf, int(cls)]) # accumulate all surviving detections across all tiles
 
-    return raw, nms(raw, 0.72), nms(raw, 0.57), tiles_coords # raw = all detections; nms50 = loose merge; nms35 = tight merge; coords for tile debug drawing
+    return raw, nms(raw, 0.62), nms(raw, 0.38), tiles_coords # raw = all detections; nms50 = loose merge; nms35 = tight merge; coords for tile debug drawing
 
 
 def draw_boxes(frame, dets, color, thickness=1):
