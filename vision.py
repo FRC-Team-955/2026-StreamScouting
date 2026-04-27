@@ -453,19 +453,33 @@ def detect_circles(frame, hole_region, active_region):
     combined = cv2.bitwise_or(edges, mask)
     blurred  = cv2.GaussianBlur(combined, (9, 9), 2)
 
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        gpu_mat = cv2.cuda_GpuMat()
+        gpu_mat.upload(blurred)
+        gpu_circles = _get_hough_detector().detect(gpu_mat)
 
-    gpu_mat = cv2.cuda_GpuMat()
-    gpu_mat.upload(blurred)
-    gpu_circles = _get_hough_detector().detect(gpu_mat)
+        circles = gpu_circles.download() if gpu_circles is not None else None
+
+    else:
+        # CPU fallback
+        print("[ERROR] CPU fallback!!")
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=15.3,
+            param1=50,
+            param2=7,
+            minRadius=5,
+            maxRadius=10
+        )
 
     detections = []
-    if gpu_circles is not None:
-        circles = gpu_circles.download()
-        if circles is not None and circles.size > 0:
-            for (x, y, r) in np.round(circles[0, :]).astype("int"):
-                gx, gy = x + ax1, y + ay1
-                if not in_region((gx, gy), hole_region) and is_approximately_yellow((gx, gy), frame):
-                    detections.append((gx, gy, r))
+    if circles is not None and circles.size > 0:
+        for (x, y, r) in np.round(circles[0, :]).astype("int"):
+            gx, gy = x + ax1, y + ay1
+            if not in_region((gx, gy), hole_region) and is_approximately_yellow((gx, gy), frame):
+                detections.append((gx, gy, r))
     return detections
 
 
