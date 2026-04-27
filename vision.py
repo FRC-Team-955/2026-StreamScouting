@@ -340,6 +340,71 @@ def solve_y(a, b, c, theta, x):
     return ((-B + sq) / (2*A), (-B - sq) / (2*A))
 
 
+def solve_x(a, b, c, theta, y):
+    """Solve the rotated conic for x given y.  Returns (x1, x2) or None."""
+    ct, st = np.cos(theta), np.sin(theta)
+    # xp = x*ct - y*st,  yp = x*st + y*ct
+    # a*(x*ct - y*st)^2 + b*(x*st + y*ct) + c = 0
+    A = a * ct**2
+    B = -2 * a * y * ct * st + b * st
+    C = a * y**2 * st**2 + b * y * ct + c
+
+    if abs(A) < 1e-10:
+        if abs(B) < 1e-10:
+            return None
+        x = -C / B
+        return (x, x)
+
+    disc = B**2 - 4 * A * C
+    if disc < 0:
+        return None
+    sq = np.sqrt(disc)
+    return ((-B + sq) / (2 * A), (-B - sq) / (2 * A))
+
+
+def sample_conic_curve(params, xs, ys, vis_w, vis_h):
+    """
+    Sample the fitted conic as a list of (x, y) pixel points suitable for
+    cv2.polylines.  Sweeps along whichever axis spans more pixels so the curve
+    looks correct for both shallow and steep shots.  Points outside the frame
+    are clipped.
+    """
+    a, b, c, theta = params
+    x_range = float(xs.max() - xs.min())
+    y_range = float(ys.max() - ys.min())
+    mean_x  = float(xs.mean())
+    mean_y  = float(ys.mean())
+
+    curve_pts = []
+
+    if x_range >= y_range:
+        # shallow shot — sweep x, solve y (original approach)
+        x_lo = max(0, int(xs.min()) - 20)
+        x_hi = min(vis_w, int(xs.max()) + 20)
+        for xi in range(x_lo, x_hi, 2):
+            sol = solve_y(a, b, c, theta, float(xi))
+            if sol is None:
+                continue
+            yi = int(round(min(sol, key=lambda v: abs(v - mean_y))))
+            if 0 <= yi < vis_h:
+                curve_pts.append((xi, yi))
+    else:
+        # steep shot — sweep y, solve x for a proper arc shape
+        y_lo = max(0, int(ys.min()) - 20)
+        y_hi = min(vis_h, int(ys.max()) + 20)
+        for yi in range(y_lo, y_hi, 2):
+            sol = solve_x(a, b, c, theta, float(yi))
+            if sol is None:
+                continue
+            xi = int(round(min(sol, key=lambda v: abs(v - mean_x))))
+            if 0 <= xi < vis_w:
+                curve_pts.append((xi, yi))
+        # sort by y so polylines draws top-to-bottom without zigzag
+        curve_pts.sort(key=lambda p: p[1])
+
+    return curve_pts
+
+
 def check_parabola_score(oid, pts, frame_idx, last_score_frame_per_id, last_score_frame, score_polygon, scored_track_ids, track_lost=False):
     # cheapest checks first so we bail before doing any polygon math
     if oid in scored_track_ids or len(pts) < 2:

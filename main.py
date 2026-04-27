@@ -26,6 +26,7 @@ from vision import (
     detect_circles,
     fit_conic,
     get_runtime_regions,
+    sample_conic_curve,
 solve_y
 )
 from robot_tracker import RobotTracker, detect_robots
@@ -158,6 +159,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
     last_score_frame        = -SCORE_COOLDOWN_FRAMES
     last_score_frame_per_id = defaultdict(lambda: -10)
     scored_track_ids        = set()
+    scored_curves           = {}   # oid -> (trail_pts, curve_pts), drawn permanently
 
     fps_window      = 30
     frame_times     = []
@@ -238,6 +240,26 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                 scored_track_ids.add(oid)
                 if oid not in origins and oid in first_seen:
                     origins[oid] = first_seen[oid]
+
+                # Snapshot a permanently drawn curve fitted to the arc *before*
+                # the ball entered the bucket — just trim the last few points
+                # where it's dropping into the hole.
+                if oid not in scored_curves:
+                    TAIL_TRIM = 3
+                    trim = list(pts)[:-TAIL_TRIM] if len(pts) > TAIL_TRIM + PARABOLA_MIN_POINTS else list(pts)
+                    trail_snap = list(pts)  # full trail for perma-draw
+                    cpts = []
+                    if len(trim) >= PARABOLA_MIN_POINTS:
+                        _xs = np.array([p[0] for p in trim], dtype=float)
+                        _ys = np.array([p[1] for p in trim], dtype=float)
+                        if max(_xs.max() - _xs.min(), _ys.max() - _ys.min()) >= 20:
+                            _params, _err = fit_conic(_xs, _ys)
+                            _vis_h, _vis_w = frame.shape[:2]
+                            _cpts = sample_conic_curve(_params, _xs, _ys, _vis_w, _vis_h)
+                            if len(_cpts) >= 5:
+                                cpts = _cpts
+                    scored_curves[oid] = (trail_snap, cpts)
+
                 print(f"  [SCORE]  ID {oid} @ frame {frame_idx} -> total: {score}")
         t_score = time.perf_counter()
 
@@ -256,42 +278,25 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
                 color = (0, int(255 * a), int(255 * (1 - a)))
                 cv2.line(vis, pts[i - 1], pts[i], color, 2)
 
-        vis_h = vis.shape[0]
-        for oid, pts in trails.items():
-            if len(pts) >= PARABOLA_MIN_POINTS:
-                trail_len = len(pts)
-                if oid not in fit_cache or fit_cache[oid][0] != trail_len:
-                    xs = np.array([p[0] for p in pts])
-                    ys = np.array([p[1] for p in pts])
-                    params, err = fit_conic(xs, ys)
-                    a, b, c, theta = params
-
-                    # cache curve points too
-                    curve_pts = []
-                    for xi in range(int(xs.min()), int(xs.max()), 2):
-                        sol = solve_y(a, b, c, theta, float(xi))
-                        if sol is None:
-                            continue
-                        for yi_f in sol:
-                            yi = int(round(yi_f))
-                            if 0 <= yi < vis_h:
-                                curve_pts.append((xi, yi))
-
-                    fit_cache[oid] = (
-                        trail_len, params, err,
-                        float(xs.min()), float(xs.max()),
-                        curve_pts,
-                    )
-                    print(
-                        f"[fit] oid={oid} err={err:.4f} a={a:.4f} b={b:.4f} "
-                        f"c={c:.4f} theta={np.degrees(theta):.1f}° pts={trail_len} "
-                        f"xs={int(xs.min())}..{int(xs.max())} ys={int(ys.min())}..{int(ys.max())}"
-                    )
-
-                _, params, err, x_min, x_max, curve_pts = fit_cache[oid]
-                col = (0, 200, 255) if err < PARABOLA_FIT_ERROR else (80, 80, 80)
-                if curve_pts:
-                    cv2.polylines(vis, [np.array(curve_pts, dtype=np.int32)], False, col, 1, cv2.LINE_AA)
+        # --- parabola fitting disabled ---
+        # vis_h = vis.shape[0]
+        # vis_w = vis.shape[1]
+        # for oid, pts in trails.items():
+        #     if len(pts) >= PARABOLA_MIN_POINTS:
+        #         trail_len = len(pts)
+        #         if oid not in fit_cache or fit_cache[oid][0] != trail_len:
+        #             xs = np.array([p[0] for p in pts])
+        #             ys = np.array([p[1] for p in pts])
+        #             if max(xs.max() - xs.min(), ys.max() - ys.min()) < 20:
+        #                 continue
+        #             params, err = fit_conic(xs, ys)
+        #             a, b, c, theta = params
+        #             curve_pts = sample_conic_curve(params, xs, ys, vis_w, vis_h)
+        #             fit_cache[oid] = (trail_len, params, err, float(xs.min()), float(xs.max()), curve_pts)
+        #         _, params, err, x_min, x_max, curve_pts = fit_cache[oid]
+        #         col = (0, 200, 255) if err < PARABOLA_FIT_ERROR else (80, 80, 80)
+        #         if len(curve_pts) >= 5:
+        #             cv2.polylines(vis, [np.array(curve_pts, dtype=np.int32)], False, col, 1, cv2.LINE_AA)
 
         for tid, track in tracker.tracks.items():
             if track.ghost_count > 0:
@@ -325,6 +330,21 @@ def run(video_path, side, frame_skip=FRAME_SKIP):
             f"draw={t_draw-t_score:.3f} "
             f"total={t_end-t_start:.3f}"
         )
+
+        # Draw permanently retained scored-shot trails and parabolas.
+        for shot_idx, (oid, (trail_pts, cpts)) in enumerate(scored_curves.items(), start=1):
+            color = (0, 165, 255)  # orange
+            # trail
+            for i in range(1, len(trail_pts)):
+                cv2.line(vis, trail_pts[i - 1], trail_pts[i], color, 2, cv2.LINE_AA)
+            # parabola fit — disabled
+            # if cpts:
+            #     cv2.polylines(vis, [np.array(cpts, dtype=np.int32)], False,
+            #                   (255, 255, 255), 1, cv2.LINE_AA)
+            # label at trail midpoint
+            mid = trail_pts[len(trail_pts) // 2]
+            cv2.putText(vis, f"#{shot_idx}", (mid[0] + 4, mid[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         cv2.putText(vis, f"Score: {score}", (460, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
