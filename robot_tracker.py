@@ -33,6 +33,8 @@ try:
     from config import (
         ROBOT_MAX_DIST,
         ROBOT_GHOST_FRAMES,
+        ROBOT_DORMANT_FRAMES,
+        ROBOT_REIDENTIFY_DIST,
         ROBOT_MAX_TRAIL,
         ROBOT_PROCESS_NOISE,
         ROBOT_MEASUREMENT_NOISE,
@@ -40,6 +42,8 @@ try:
 except ImportError:
     ROBOT_MAX_DIST          = 60
     ROBOT_GHOST_FRAMES      = 12
+    ROBOT_DORMANT_FRAMES    = 60
+    ROBOT_REIDENTIFY_DIST   = 120
     ROBOT_MAX_TRAIL         = 60
     ROBOT_PROCESS_NOISE     = 5e-2
     ROBOT_MEASUREMENT_NOISE = 0.5
@@ -201,8 +205,11 @@ class RobotTrack:
             self.alliance = alliance
 
     def update_from_optic_flow(self, cx: int, cy: int) -> None:
-        """Soft update — does not reset ghost_count or count as a detection."""
-        self.kf.correct(np.array([[cx], [cy]], dtype=np.float32))
+        """Soft positional nudge from optical flow — trail only, Kalman predicts freely."""
+        # Do NOT call kf.correct() here — optical flow is too noisy to use as
+        # a hard measurement and it would override Kalman's momentum, making
+        # the ghost jump around.  Just record the point for the trail so the
+        # visual path stays continuous.
         self.trail.append((cx, cy))
         self.perma_path.append((cx, cy))
 
@@ -312,7 +319,7 @@ class RobotTracker:
         """
         self._frame_idx += 1
 
-        # Normalise to always have raw_box field (last 4 elements)
+        # Normalise to always have raw_box field
         norm_dets = []
         for d in detections:
             cx, cy, w, h, alliance = d[0], d[1], d[2], d[3], d[4]
@@ -322,38 +329,71 @@ class RobotTracker:
                 raw_box = (cx - w // 2, cy - h // 2, cx + w // 2, cy + h // 2)
             norm_dets.append((cx, cy, w, h, alliance, raw_box))
 
-        # ── Optical-flow update for ghosted, initialized slots ────────────
+        # ── Reset dormant slots so they can re-initialize to a new robot ──
+        # A slot that has been ghosted longer than ROBOT_DORMANT_FRAMES is
+        # treated as vacant — wipe its state so the Hungarian ignores it and
+        # the uninitialized-slot pass can claim a nearby detection.
+        for track in self.tracks.values():
+            if track.initialized and track.ghost_count >= ROBOT_DORMANT_FRAMES:
+                track.initialized  = False
+                track.ghost_count  = 0
+                track.last_box     = None
+                track._of_tracker  = None
+                track.trail.clear()
+                # keep perma_path so the historical line stays visible
+
+        # ── Optical-flow nudge for ghosted initialized slots ──────────────
         if crop_frame is not None:
             for track in self.tracks.values():
                 if track.initialized and track.ghost_count > 0 and track._of_tracker is not None:
-                    ok, (cx, cy) = track._of_tracker.update(crop_frame)
+                    ok, (fx, fy) = track._of_tracker.update(crop_frame)
                     if ok:
-                        track.update_from_optic_flow(cx, cy)
+                        track.update_from_optic_flow(fx, fy)
 
-        # ── Kalman predict (only initialized slots participate in matching) ─
+        # ── Kalman predict — initialized slots only ────────────────────────
         predictions = {
             tid: t.predict()
             for tid, t in self.tracks.items()
             if t.initialized
         }
 
-        # Strip to (cx, cy, w, h, alliance) for the matcher
+        # ── Hungarian match initialized slots → detections ────────────────
         match_dets = [(d[0], d[1], d[2], d[3], d[4]) for d in norm_dets]
-
-        # ── Hungarian assignment ──────────────────────────────────────────
-        matched = self._hungarian_match(match_dets, predictions)
+        matched    = self._hungarian_match(match_dets, predictions)
         # matched: {slot_id: det_index}
 
-        # Also let uninitialized slots grab detections not yet claimed
-        claimed_dets = set(matched.values())
-        for tid, track in self.tracks.items():
-            if track.initialized or tid in matched:
-                continue
-            for di, d in enumerate(norm_dets):
-                if di not in claimed_dets:
-                    matched[tid] = di
-                    claimed_dets.add(di)
-                    break
+        # ── Nearest-first assignment for uninitialized slots ──────────────
+        # Sort unclaimed detections by distance to each uninit slot and assign
+        # greedily — prevents early slots in iteration order from stealing
+        # detections that are geometrically closer to later slots.
+        claimed_dets  = set(matched.values())
+        uninit_slots  = [tid for tid, t in self.tracks.items()
+                         if not t.initialized and tid not in matched]
+
+        if uninit_slots and len(norm_dets) > len(claimed_dets):
+            # Build (dist, slot_id, det_idx) for every uninit×unclaimed pair
+            candidates = []
+            for tid in uninit_slots:
+                for di, d in enumerate(norm_dets):
+                    if di not in claimed_dets:
+                        candidates.append((di, tid))   # no distance filter for first init
+
+            # Assign by nearest distance, one det per slot, one slot per det
+            pairs_with_dist = []
+            for di, tid in candidates:
+                cx, cy = norm_dets[di][0], norm_dets[di][1]
+                # Use frame centre as a neutral starting point for uninit slots
+                # (any detection is valid — no spatial prior exists yet)
+                pairs_with_dist.append((0.0, tid, di))  # equal priority = FIFO by slot id
+
+            # Deduplicate: each slot takes first unclaimed det in slot-id order
+            slots_done = set()
+            for _, tid, di in sorted(pairs_with_dist):
+                if tid in slots_done or di in claimed_dets:
+                    continue
+                matched[tid]     = di
+                claimed_dets.add(di)
+                slots_done.add(tid)
 
         # ── Update matched slots ──────────────────────────────────────────
         matched_ids = set(matched.keys())
@@ -365,7 +405,7 @@ class RobotTracker:
                 self.tracks[tid]._of_tracker = _OpticFlowTracker(
                     crop_frame, (x1, y1, x2, y2))
 
-        # ── Ghost unmatched initialized slots ─────────────────────────────
+        # ── Increment ghost count for unmatched initialized slots ─────────
         for tid, track in self.tracks.items():
             if tid not in matched_ids and track.initialized:
                 track.ghost_count += 1
@@ -437,7 +477,14 @@ class RobotTracker:
             detections: List[Tuple[int, int, int, int, str]],
             predictions: Dict[int, Tuple[int, int]],
     ) -> Dict[int, int]:
-        """Returns {slot_id: det_index} for pairs within ROBOT_MAX_DIST."""
+        """Returns {slot_id: det_index} for pairs within ROBOT_REIDENTIFY_DIST.
+
+        ROBOT_MAX_DIST        — normal frame-to-frame movement cap.
+        ROBOT_REIDENTIFY_DIST — wider cap for slots that have been ghosted and
+                                 need to snap back to a re-appearing robot.
+        Cost matrix cells beyond ROBOT_REIDENTIFY_DIST are set to 1e9 so
+        Hungarian never forces a match across the whole frame.
+        """
         if not detections or not predictions:
             return {}
 
@@ -445,16 +492,18 @@ class RobotTracker:
         n_slots  = len(slot_ids)
         n_dets   = len(detections)
 
-        cost = np.full((n_slots, n_dets), fill_value=1e6, dtype=np.float64)
+        cost = np.full((n_slots, n_dets), fill_value=1e9, dtype=np.float64)
         for si, tid in enumerate(slot_ids):
             px, py = predictions[tid]
             for di, (cx, cy, *_) in enumerate(detections):
-                cost[si, di] = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+                d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+                if d <= ROBOT_REIDENTIFY_DIST:
+                    cost[si, di] = d
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
         result = {}
         for si, di in zip(row_ind, col_ind):
-            if cost[si, di] <= ROBOT_MAX_DIST:
+            if cost[si, di] <= ROBOT_REIDENTIFY_DIST:
                 result[slot_ids[si]] = di
         return result

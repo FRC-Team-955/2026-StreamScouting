@@ -16,6 +16,11 @@ ASPECT_MAX_LOOSE   = 2.5
 ASPECT_MAX_TIGHT   = 1.35
 NMS_IOU            = 0.38
 
+try:
+    from config import ROBOT_MIN_AREA
+except ImportError:
+    ROBOT_MIN_AREA = 1400
+
 _model = None
 
 def _get_model() -> YOLO:
@@ -65,6 +70,8 @@ def _nms(dets: list, iou_thresh: float) -> list:
 def _passes_shape(gx1, gy1, gx2, gy2) -> bool:
     bw, bh = gx2 - gx1, gy2 - gy1
     area = bw * bh
+    if area < ROBOT_MIN_AREA:          # too small — noise / ball / debris
+        return False
     if area > MAX_BOX_AREA:
         return False
     if area > ASPECT_AREA_THRESH:
@@ -83,7 +90,7 @@ def _run_inference(frame: np.ndarray) -> list:
 
     raw = []
     for result, (x0, y0, _, _) in zip(
-        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=False),
+        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=True),
         tiles_coords,
     ):
         if result.boxes is None:
