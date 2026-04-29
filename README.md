@@ -16,6 +16,10 @@ numpy==2.2.4
 
 scipy
 
+lap
+
+argparse
+
 
 reccomend a CUDA capable GPU, with CUDA dev tools and cuDNN.
 CPU fallback is availabe, but is SLOW!
@@ -32,7 +36,7 @@ example setup and run:
 
 ```pip install https://github.com/cudawarped/opencv-python-cuda-wheels/releases/download/4.13.0.90/opencv_contrib_python-4.13.0.90-cp37-abi3-linux_x86_64.whl```
 
-```pip install ultralytics tqdm numpy==2.2.4 scipy```
+```pip install ultralytics tqdm numpy==2.2.4 scipy lap argparse```
 
 ```pip install torch --index-url https://download.pytorch.org/whl/cu128```
 
