@@ -15,6 +15,9 @@ from config import (
     SKIP_SECONDS,
     TRAIL_DECAY,
     SCORE_POLYGON_REF_BY_SIDE,
+    ATTRIBUTION_MAX_DIST,
+    ATTRIBUTION_TIME_TOL,
+    MATCH_PERIODS,
 )
 from tracker import Tracker
 from vision import (
@@ -40,6 +43,62 @@ def get_frame_at_index(cap, frame_idx):
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ret, frame = cap.read()
     return frame if ret else None
+
+
+def period_for_frame(frame_idx, fps, skip_frames):
+    """Return the period name (from MATCH_PERIODS) for a given absolute frame index."""
+    elapsed_s = (frame_idx - skip_frames) / max(fps, 1)
+    for name, end_s in MATCH_PERIODS:
+        if elapsed_s < end_s:
+            return name
+    return MATCH_PERIODS[-1][0]  # past end of last period — still last period
+
+
+def period_names():
+    """Ordered list of period name strings from config."""
+    return [name for name, _ in MATCH_PERIODS]
+
+
+def attribute_shot(ball_start_frame: int,
+                   ball_start_pos: tuple,
+                   robot_tracks: dict) -> int | None:
+    """Return the robot slot ID most likely to have fired this ball, or None.
+
+    Searches each robot's perma_path for the point whose frame_idx is closest
+    to ball_start_frame (within ATTRIBUTION_TIME_TOL), then checks spatial
+    distance.  The robot with the best combined score wins.
+
+    perma_path entries are (x, y, frame_idx).
+    """
+    bx, by = ball_start_pos
+    best_slot  = None
+    best_dist  = float("inf")
+
+    for slot_id, track in robot_tracks.items():
+        if not track.initialized or not track.perma_path:
+            continue
+
+        # Binary-search-style: find the perma_path entry closest in time
+        # (perma_path is appended in order so frame_idx is monotonically non-decreasing)
+        closest_pt = None
+        closest_dt = float("inf")
+        for pt in track.perma_path:
+            px, py, pfidx = pt
+            dt = abs(pfidx - ball_start_frame)
+            if dt < closest_dt:
+                closest_dt = dt
+                closest_pt = pt
+
+        if closest_pt is None or closest_dt > ATTRIBUTION_TIME_TOL:
+            continue   # no temporally valid sample for this robot
+
+        px, py, _ = closest_pt
+        dist = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
+        if dist < ATTRIBUTION_MAX_DIST and dist < best_dist:
+            best_dist = dist
+            best_slot = slot_id
+
+    return best_slot
 
 
 def polygon_center(polygon):
@@ -166,6 +225,13 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
     scored_track_ids        = set()
     scored_curves           = {}   # oid -> (trail_pts, curve_pts), drawn permanently
 
+    # Per-robot scores: {slot_id: {"total": int, <period_name>: int, ...}}
+    _pnames = period_names()
+    robot_scores = {i: {"total": 0, **{p: 0 for p in _pnames}}
+                    for i in range(6)}
+    # {canon_oid -> slot_id} so we can attribute post-hoc stitched shots
+    shot_robot_map: dict = {}
+
     stitcher        = PathStitcher()
     fps_window      = 30
     frame_times     = []
@@ -280,7 +346,21 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
                     trail_snap = list(full_trails.get(oid, []))
                     scored_curves[canon_oid] = (trail_snap, [])
 
-                print(f"  [SCORE]  ID {canon_oid} @ frame {frame_idx} -> total: {score}")
+                # ── Attribute this shot to the nearest robot ──────────────
+                ball_start_pos   = full_trails[oid][0] if full_trails.get(oid) else pts[0]
+                ball_start_frame = frame_idx - len(pts) + 1  # approx launch frame
+                slot_id = attribute_shot(ball_start_frame, ball_start_pos,
+                                         robot_tracker.tracks)
+                if slot_id is not None:
+                    period = period_for_frame(ball_start_frame, fps, skip_frames)
+                    robot_scores[slot_id]["total"]  += 1
+                    robot_scores[slot_id][period]   += 1
+                    shot_robot_map[canon_oid] = slot_id
+                    print(f"  [SCORE]  ID {canon_oid} @ frame {frame_idx} -> total: {score}"
+                          f"  robot slot {slot_id} ({period})")
+                else:
+                    print(f"  [SCORE]  ID {canon_oid} @ frame {frame_idx} -> total: {score}"
+                          f"  (no robot attribution)")
 
         # ── post-hoc scored-curve stitching (upgraded, replaces old loop) ──
         scored_curves = stitcher.stitch_scored_curves(scored_curves)
@@ -355,21 +435,58 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
             f"total={t_end-t_start:.3f}"
         )
 
-        # Draw permanently retained scored-shot trails and parabolas.
+        # ── Draw permanently retained scored-shot trails ───────────────────
         for shot_idx, (oid, (trail_pts, cpts)) in enumerate(scored_curves.items(), start=1):
-            color = (0, 165, 255)  # orange
-            # trail
+            # Color the trail by which robot shot it (slot color) or orange if unattributed
+            r_slot = shot_robot_map.get(oid)
+            from robot_tracker import _SLOT_COLORS
+            shot_color = _SLOT_COLORS[r_slot % len(_SLOT_COLORS)] if r_slot is not None \
+                         else (0, 165, 255)
             for i in range(1, len(trail_pts)):
-                cv2.line(vis, trail_pts[i - 1], trail_pts[i], color, 2, cv2.LINE_AA)
-            # parabola fit — disabled
-            # if cpts:
-            #     cv2.polylines(vis, [np.array(cpts, dtype=np.int32)], False,
-            #                   (255, 255, 255), 1, cv2.LINE_AA)
-            # label at trail midpoint
+                cv2.line(vis, trail_pts[i - 1], trail_pts[i], shot_color, 2, cv2.LINE_AA)
             mid = trail_pts[len(trail_pts) // 2]
             cv2.putText(vis, f"#{shot_idx}", (mid[0] + 4, mid[1] - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, shot_color, 1, cv2.LINE_AA)
 
+        # ── Robot score labels next to each live robot box ─────────────────
+        from robot_tracker import _SLOT_COLORS
+        for slot_id, track in robot_tracker.tracks.items():
+            if not track.initialized:
+                continue
+            rs = robot_scores[slot_id]
+            alliance_word = {"red": "RED", "blue": "BLU", "unknown": "UNK"}.get(
+                track.alliance, "UNK")
+            same_alliance = [sid for sid, t in robot_tracker.tracks.items()
+                             if t.alliance == track.alliance and sid <= slot_id]
+            alliance_num  = len(same_alliance)
+            robot_label   = f"{alliance_word} {alliance_num}"
+            # Build period breakdown dynamically e.g. "A:2 T:1 E:0"
+            period_parts  = " ".join(f"{n[0].upper()}:{rs[n]}" for n, _ in MATCH_PERIODS)
+            score_label   = f"{rs['total']}pt  {period_parts}"
+
+            slot_color = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
+            if track.last_box is not None and track.ghost_count == 0:
+                bx2 = track.last_box[2]
+                by1 = track.last_box[1]
+            else:
+                px, py = track.position()
+                bx2, by1 = px + track.w // 2, py - track.h // 2
+
+            cv2.putText(vis, robot_label, (bx2 + 4, by1 + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, slot_color, 1, cv2.LINE_AA)
+            cv2.putText(vis, score_label, (bx2 + 4, by1 + 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, slot_color, 1, cv2.LINE_AA)
+
+        # ── Current game period indicator ──────────────────────────────────
+        current_period = period_for_frame(frame_idx, fps, skip_frames)
+        # Cycle through distinct colors for however many periods exist
+        _period_colors = [(0,255,255),(0,255,0),(0,140,255),(255,200,0),(200,0,255)]
+        _pidx = next((i for i, (n,_) in enumerate(MATCH_PERIODS) if n == current_period), 0)
+        period_color = _period_colors[_pidx % len(_period_colors)]
+        cv2.putText(vis, current_period.upper(), (4, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, period_color, 2, cv2.LINE_AA)
+
+        # ── Top-right HUD ──────────────────────────────────────────────────
         cv2.putText(vis, f"Score: {score}", (460, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(vis, f"{display_fps:.1f}/{(60 / max(1, frame_skip)):.0f} fps  tracks: {len(tracker.tracks)}",
@@ -385,12 +502,106 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
         cv2.putText(vis, f"YOLO {yolo_ms:.0f} ms  Motion: {'GPU' if _rg else 'CPU'}{wait_tag}",
                     (460, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.46, yolo_color, 1)
 
+        # ── Live scoreboard table ──────────────────────────────────────────
+        # Drawn as a semi-transparent dark panel at bottom-left so it's
+        # always readable regardless of field content.
+        _pnames     = period_names()
+        attributed  = sum(rs["total"] for rs in robot_scores.values())
+        t_factor    = attributed / score if score > 0 else 0.0
+        col_w       = 44   # px per period column
+        row_h       = 16
+        n_cols      = 2 + len(_pnames) + 1   # robot | total | periods... | scaled
+        table_w     = 88 + col_w * (len(_pnames) + 1)
+        n_rows      = 7   # header + 6 robots
+        table_h     = row_h * (n_rows + 1) + 8
+        tx, ty      = 4, vis.shape[0] - table_h - 4
+
+        # Dark background panel
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (tx - 2, ty - 2),
+                      (tx + table_w, ty + table_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
+
+        # Header row
+        hdr_y = ty + row_h
+        cv2.putText(vis, "ROBOT", (tx + 2, hdr_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+        cv2.putText(vis, "TOT", (tx + 90, hdr_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+        for pi, pname in enumerate(_pnames):
+            cv2.putText(vis, pname[:3].upper(), (tx + 90 + col_w*(pi+1), hdr_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+        cv2.putText(vis, "EST", (tx + 90 + col_w*(len(_pnames)+1), hdr_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+
+        # Divider
+        div_y = ty + row_h + 3
+        cv2.line(vis, (tx, div_y), (tx + table_w, div_y), (100,100,100), 1)
+
+        for row, (slot_id, rs) in enumerate(robot_scores.items()):
+            ry = ty + row_h * (row + 2) + 4
+            rtrack   = robot_tracker.tracks[slot_id]
+            aw       = {"red":"RED","blue":"BLU","unknown":"UNK"}.get(rtrack.alliance,"UNK")
+            same_al  = [sid for sid,t in robot_tracker.tracks.items()
+                        if t.alliance == rtrack.alliance and sid <= slot_id]
+            anum     = len(same_al)
+            row_label = f"{aw}{anum}"
+            slot_col  = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
+
+            cv2.putText(vis, row_label, (tx + 2, ry),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, slot_col, 1)
+            cv2.putText(vis, str(rs["total"]), (tx + 90, ry),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, slot_col, 1)
+            for pi, pname in enumerate(_pnames):
+                cv2.putText(vis, str(rs[pname]),
+                            (tx + 90 + col_w*(pi+1), ry),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, slot_col, 1)
+            scaled = rs["total"] / t_factor if t_factor > 0 else 0.0
+            cv2.putText(vis, f"{scaled:.1f}",
+                        (tx + 90 + col_w*(len(_pnames)+1), ry),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, slot_col, 1)
+
+        # Footer: tracking factor
+        foot_y = ty + table_h - 2
+        cv2.putText(vis, f"trk={t_factor:.2f}  attr={attributed}/{score}",
+                    (tx + 2, foot_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160,160,160), 1)
+
         cv2.imshow("tracking", vis)
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
+    # ── End-of-match summary ───────────────────────────────────────────────
+    attributed_total = sum(rs["total"] for rs in robot_scores.values())
+    # Tracking error factor: what fraction of scored balls we could attribute
+    # to a specific robot.  1.0 = perfect attribution, <1.0 = some shots lost.
+    tracking_factor = attributed_total / score if score > 0 else 0.0
+
+    print("\n" + "=" * 60)
+    print(f"  MATCH SCORE (ball tracker): {score}")
+    print(f"  Attributed shots:           {attributed_total}")
+    print(f"  Tracking error factor:      {tracking_factor:.3f}  "
+          f"({'perfect' if tracking_factor == 1.0 else 'some shots unattributed'})")
+    print("-" * 60)
+    print(f"  {'Robot':<12} {'Total':>5}  {'Auto':>5}  {'Teleop':>6}  {'Endgame':>7}  {'Scaled':>7}")
+    for slot_id, rs in robot_scores.items():
+        track = robot_tracker.tracks[slot_id]
+        alliance_word = {"red": "RED", "blue": "BLU", "unknown": "UNK"}.get(
+            track.alliance, "UNK")
+        same_alliance = [sid for sid, t in robot_tracker.tracks.items()
+                         if t.alliance == track.alliance and sid <= slot_id]
+        alliance_num  = len(same_alliance)
+        label = f"{alliance_word} {alliance_num} (s{slot_id})"
+        # Scale each robot's score by the tracking factor — gives best estimate
+        # of true contribution accounting for missed attributions
+        scaled = rs["total"] / tracking_factor if tracking_factor > 0 else 0.0
+        print(f"  {label:<12} {rs['total']:>5}  {rs['auto']:>5}  {rs['teleop']:>6}"
+              f"  {rs['endgame']:>7}  {scaled:>7.2f}")
+    print("=" * 60 + "\n")
+
     return score
 
 

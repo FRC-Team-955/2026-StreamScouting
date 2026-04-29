@@ -55,3 +55,25 @@ ROBOT_PROCESS_NOISE     = 0.05
 ROBOT_MEASUREMENT_NOISE = 0.9
 ROBOT_MIN_AREA          = 1400
 ROBOT_MAX_AREA          = 3000
+
+# ── Robot attribution ──────────────────────────────────────────────────────
+# Max spatial distance (crop-space px) between a ball's launch point and a
+# robot's position at that same frame to count as "this robot shot it".
+ATTRIBUTION_MAX_DIST    = 120
+
+# Max frame difference between the ball's first-seen frame and the robot
+# position sample used for attribution.  Keeps us from attributing to a
+# robot that was nearby but at a completely different time.
+ATTRIBUTION_TIME_TOL    = 6   # frames
+
+# ── Game periods (seconds from match start, after SKIP_SECONDS offset) ────
+# this is just tesing
+PERIOD_AUTO_END_S       = 15   # autonomous ends at 15 s
+PERIOD_TELEOP_END_S     = 135  # teleop ends at 135 s (endgame begins)
+PERIOD_MATCH_END_S      = 150  # full match length
+
+MATCH_PERIODS = [
+    ("auto", PERIOD_AUTO_END_S),
+    ("teleop", PERIOD_TELEOP_END_S),
+    ("endgame", PERIOD_MATCH_END_S),
+]

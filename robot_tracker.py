@@ -181,6 +181,7 @@ class RobotTrack:
     last_box: Optional[Tuple[int,int,int,int]] = None   # (x1, y1, x2, y2)
 
     trail:      deque = field(default_factory=lambda: deque(maxlen=ROBOT_MAX_TRAIL))
+    # perma_path stores (x, y, frame_idx) so attribution can align space AND time
     perma_path: list  = field(default_factory=list)
 
     _of_tracker: object = field(default=None, repr=False)
@@ -191,7 +192,8 @@ class RobotTrack:
 
     def update(self, cx: int, cy: int, w: int, h: int,
                alliance: str = "unknown",
-               raw_box: Optional[Tuple[int,int,int,int]] = None) -> None:
+               raw_box: Optional[Tuple[int,int,int,int]] = None,
+               frame_idx: int = 0) -> None:
         self.kf.correct(np.array([[cx], [cy]], dtype=np.float32))
         self.ghost_count  = 0
         self.initialized  = True
@@ -200,18 +202,15 @@ class RobotTrack:
             cx - w // 2, cy - h // 2, cx + w // 2, cy + h // 2
         )
         self.trail.append((cx, cy))
-        self.perma_path.append((cx, cy))
+        # perma_path stores (x, y, frame_idx) for space+time attribution
+        self.perma_path.append((cx, cy, frame_idx))
         if self.alliance == "unknown" and alliance != "unknown":
             self.alliance = alliance
 
-    def update_from_optic_flow(self, cx: int, cy: int) -> None:
+    def update_from_optic_flow(self, cx: int, cy: int, frame_idx: int = 0) -> None:
         """Soft positional nudge from optical flow — trail only, Kalman predicts freely."""
-        # Do NOT call kf.correct() here — optical flow is too noisy to use as
-        # a hard measurement and it would override Kalman's momentum, making
-        # the ghost jump around.  Just record the point for the trail so the
-        # visual path stays continuous.
         self.trail.append((cx, cy))
-        self.perma_path.append((cx, cy))
+        self.perma_path.append((cx, cy, frame_idx))
 
     def position(self) -> Tuple[int, int]:
         s = self.kf.statePost
@@ -348,7 +347,7 @@ class RobotTracker:
                 if track.initialized and track.ghost_count > 0 and track._of_tracker is not None:
                     ok, (fx, fy) = track._of_tracker.update(crop_frame)
                     if ok:
-                        track.update_from_optic_flow(fx, fy)
+                        track.update_from_optic_flow(fx, fy, frame_idx=self._frame_idx)
 
         # ── Kalman predict — initialized slots only ────────────────────────
         predictions = {
@@ -399,7 +398,8 @@ class RobotTracker:
         matched_ids = set(matched.keys())
         for tid, di in matched.items():
             cx, cy, w, h, alliance, raw_box = norm_dets[di]
-            self.tracks[tid].update(cx, cy, w, h, alliance, raw_box=raw_box)
+            self.tracks[tid].update(cx, cy, w, h, alliance, raw_box=raw_box,
+                                    frame_idx=self._frame_idx)
             if crop_frame is not None:
                 x1, y1, x2, y2 = raw_box
                 self.tracks[tid]._of_tracker = _OpticFlowTracker(
@@ -434,7 +434,7 @@ class RobotTracker:
                 for i in range(1, n):
                     fade = 0.15 + 0.85 * (i / n)
                     c    = tuple(int(ch * fade * alpha) for ch in slot_color)
-                    cv2.line(frame, ppath[i - 1], ppath[i], c, 1, cv2.LINE_AA)
+                    cv2.line(frame, ppath[i - 1][:2], ppath[i][:2], c, 1, cv2.LINE_AA)
 
             # ── Recent trail (thick, bright) ──────────────────────────────
             pts = list(track.trail)
