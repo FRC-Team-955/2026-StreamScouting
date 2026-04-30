@@ -18,6 +18,7 @@ from config import (
     ATTRIBUTION_MAX_DIST,
     ATTRIBUTION_TIME_TOL,
     MATCH_PERIODS,
+    ROBOT_TRACK_LOSS_OK,
 )
 from tracker import Tracker
 from vision import (
@@ -30,12 +31,396 @@ from vision import (
     fit_conic,
     get_runtime_regions,
     sample_conic_curve,
-solve_y
+    solve_y,
 )
-from robot_tracker import RobotTracker, detect_robots
+from robot_tracker import RobotTracker, detect_robots, _SLOT_COLORS, NUM_ROBOTS
 from robot_detector import get_yolo_latency_ms
 
 from path_stitcher import PathStitcher
+
+
+# ---------------------------------------------------------------------------
+# Robot re-identification UI  (draw-box edition)
+# ---------------------------------------------------------------------------
+
+class RobotIDUI:
+    """
+    Pauses playback and lets the operator draw a bounding box for each robot
+    slot that needs re-identification.
+
+    Interaction per slot
+    --------------------
+    Left-click + drag   → draw / redraw the box for this slot.
+    "Confirm" button    → accept the box and advance to the next slot.
+    "Not in frame" btn  → mark this slot as absent and advance.
+    "Done" button       → visible only when every slot is resolved; close UI.
+    ESC                 → abort the whole session (returns None).
+
+    Coordinates
+    -----------
+    All coordinates returned are in CROP-SPACE.  The caller supplies
+    crop_offset=(crop_x, crop_y) so the UI can show the full raw frame while
+    internally converting click coords back to crop-space.
+
+    Usage
+    -----
+    ui = RobotIDUI(robot_tracker)
+    result = ui.run(raw_frame, crop_offset, slot_ids, prompt="")
+    # result: {slot_id: (crop_cx, crop_cy)} — absent slots are omitted
+    # result is None if the user pressed ESC / aborted
+    ui.apply_assignments(result, frame_idx)
+    """
+
+    _WINDOW     = "Robot Re-ID"
+    _BTN_H      = 38      # button bar height (px)
+    _BTN_PAD    = 8       # padding inside button bar
+    _BANNER_H   = 48      # top info banner height (px)
+
+    # Button definitions: (label, key, bg_color, text_color)
+    _BTNS = [
+        ("Confirm [C]",      ord("c"), (30, 160,  30), (255, 255, 255)),
+        ("Not in frame [N]", ord("n"), (30,  30, 160), (255, 255, 255)),
+        ("Done [D]",         ord("d"), (0,  180,  90), (255, 255, 255)),
+        ("Skip [ESC]",       27,       (60,  60,  60), (200, 200, 200)),
+    ]
+
+    def __init__(self, robot_tracker: "RobotTracker"):
+        self._rt       = robot_tracker
+        self._cb_state = [None]   # [0] = active state dict, or None = disabled
+
+    # ------------------------------------------------------------------
+    def run(
+            self,
+            display_frame: np.ndarray,
+            crop_offset: tuple,
+            slot_ids: list,
+            prompt: str = "",
+    ) -> dict | None:
+        """
+        Walk through *slot_ids* one at a time.
+
+        Returns
+        -------
+        dict  {slot_id: (crop_cx, crop_cy)}  — absent/skipped slots omitted.
+        None  if the user aborted with ESC before finishing.
+        """
+        if not slot_ids:
+            return {}
+
+        ox, oy   = crop_offset
+        result   = {}          # slot_id -> (crop_cx, crop_cy)
+        absent   = set()       # slot_ids marked "not in frame"
+        aborted  = False
+
+        cv2.namedWindow(self._WINDOW, cv2.WINDOW_NORMAL)
+
+        # Single persistent callback container — lives on self so it can never
+        # be garbage-collected while OpenCV still holds a reference to _mouse.
+        self._cb_state[0] = None   # reset for this run() call
+
+        def _mouse(event, x, y, flags, *args):
+            s = self._cb_state[0]
+            if s is None:          # callback disabled between slots — ignore
+                return
+            s["mouse_pos"] = (x, y)
+            # Ignore events inside the button bar or banner
+            h_total = _canvas_h(display_frame)
+            btn_top = h_total - self._BTN_H
+            if y >= btn_top or y <= self._BANNER_H:
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    self._handle_btn_click(x, y, display_frame, s)
+                s["dragging"] = False
+                return
+            if event == cv2.EVENT_LBUTTONDOWN:
+                s["box_start"] = (x, y)
+                s["box_end"]   = (x, y)
+                s["dragging"]  = True
+            elif event == cv2.EVENT_MOUSEMOVE and s["dragging"]:
+                s["box_end"] = (x, y)
+            elif event == cv2.EVENT_LBUTTONUP and s["dragging"]:
+                s["box_end"]  = (x, y)
+                s["dragging"] = False
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                # Right-click clears the current box
+                s["box_start"] = None
+                s["box_end"]   = None
+
+        cv2.setMouseCallback(self._WINDOW, _mouse)
+
+        current_idx = 0
+        while current_idx < len(slot_ids):
+            slot_id = slot_ids[current_idx]
+            color   = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
+
+            # Reset shared state for this slot; keep _cb_state[0] pointing at it
+            state = {
+                "box_start":    None,
+                "box_end":      None,
+                "dragging":     False,
+                "confirmed":    False,
+                "not_in_frame": False,
+                "done":         False,
+                "abort":        False,
+                "mouse_pos":    (0, 0),
+                # stored so _mouse can read them without a closure over loop vars
+                "_slot_id":     slot_id,
+                "_current_idx": current_idx,
+                "_slot_ids":    slot_ids,
+                "_result":      result,
+                "_absent":      absent,
+            }
+            self._cb_state[0] = state   # enable callback for this slot
+
+            # Inner repaint loop for this slot
+            while not state["confirmed"] and not state["not_in_frame"] \
+                    and not state["done"] and not state["abort"]:
+
+                canvas = self._build_canvas(
+                    display_frame, slot_id, current_idx, slot_ids,
+                    color, state, result, absent, ox, oy, prompt
+                )
+                cv2.imshow(self._WINDOW, canvas)
+                key = cv2.waitKey(20) & 0xFF
+
+                if key == 27:                    # ESC → abort
+                    state["abort"] = True
+                elif key in (ord("c"), 13):      # C or Enter → confirm
+                    if state["box_start"] and state["box_end"]:
+                        state["confirmed"] = True
+                elif key == ord("n"):            # N → not in frame
+                    state["not_in_frame"] = True
+                elif key == ord("d"):            # D → done (only if all resolved)
+                    all_done = all(
+                        (s in result or s in absent)
+                        for s in slot_ids
+                    )
+                    if all_done:
+                        state["done"] = True
+
+            # Disable callback before we modify any shared state so a stray
+            # mouse event between iterations can never write to a dead dict.
+            self._cb_state[0] = None
+
+            if state["abort"]:
+                aborted = True
+                break
+
+            if state["done"]:
+                break
+
+            if state["confirmed"] and state["box_start"] and state["box_end"]:
+                bx1 = min(state["box_start"][0], state["box_end"][0])
+                by1 = min(state["box_start"][1], state["box_end"][1])
+                bx2 = max(state["box_start"][0], state["box_end"][0])
+                by2 = max(state["box_start"][1], state["box_end"][1])
+                cx  = ((bx1 + bx2) // 2) - ox
+                cy  = ((by1 + by2) // 2) - oy
+                result[slot_id] = (cx, cy)
+                print(f"  [RobotID] Slot {slot_id} → box ({bx1},{by1})-({bx2},{by2})  "
+                      f"crop centre ({cx},{cy})")
+            elif state["not_in_frame"]:
+                absent.add(slot_id)
+                print(f"  [RobotID] Slot {slot_id} → not in frame")
+
+            current_idx += 1
+
+        cv2.destroyWindow(self._WINDOW)
+        if aborted:
+            print("  [RobotID] Aborted by user.")
+            return None
+        return result
+
+    # ------------------------------------------------------------------
+    def _handle_btn_click(self, x, y, display_frame, state):
+        """Map a click in the button bar to a state transition."""
+        slot_ids  = state["_slot_ids"]
+        result    = state["_result"]
+        absent    = state["_absent"]
+        btn_rects = self._button_rects(display_frame)
+        for i, rect in enumerate(btn_rects):
+            bx1, by1, bx2, by2 = rect
+            if bx1 <= x <= bx2 and by1 <= y <= by2:
+                label = self._BTNS[i][0]
+                if "Confirm" in label:
+                    if state["box_start"] and state["box_end"]:
+                        state["confirmed"] = True
+                elif "Not in frame" in label:
+                    state["not_in_frame"] = True
+                elif "Done" in label:
+                    all_done = all(
+                        (s in result or s in absent)
+                        for s in slot_ids
+                    )
+                    if all_done:
+                        state["done"] = True
+                elif "Skip" in label:
+                    state["abort"] = True
+                break
+
+    # ------------------------------------------------------------------
+    def _button_rects(self, frame):
+        """Return (x1, y1, x2, y2) in canvas coords for each button."""
+        h = _canvas_h(frame)
+        w = frame.shape[1]
+        n       = len(self._BTNS)
+        btn_w   = (w - self._BTN_PAD * (n + 1)) // n
+        y1      = h - self._BTN_H + self._BTN_PAD // 2
+        y2      = h - self._BTN_PAD // 2
+        rects   = []
+        for i in range(n):
+            x1 = self._BTN_PAD + i * (btn_w + self._BTN_PAD)
+            rects.append((x1, y1, x1 + btn_w, y2))
+        return rects
+
+    # ------------------------------------------------------------------
+    def _build_canvas(self, base_frame, slot_id, current_idx, slot_ids,
+                      color, state, result, absent, ox, oy, prompt):
+        """Composite the annotation layer on top of base_frame."""
+        h_base, w = base_frame.shape[:2]
+        canvas_h  = _canvas_h(base_frame)
+        # Allocate canvas with extra space at top (banner) and bottom (buttons)
+        extra_top = self._BANNER_H
+        canvas = np.zeros((canvas_h, w, 3), dtype=np.uint8)
+        canvas[extra_top: extra_top + h_base] = base_frame
+
+        # Offset everything: frame content starts at y=extra_top
+        frame_oy = extra_top
+
+        # ── Draw existing robot positions (already initialized) ───────────
+        for sid, track in self._rt.tracks.items():
+            if not track.initialized:
+                continue
+            c = _SLOT_COLORS[sid % len(_SLOT_COLORS)]
+            px, py = track.position()
+            dpx, dpy = px + ox + 0, py + oy + frame_oy  # raw display → canvas
+            # Shift: display_frame is the raw_frame, crop is inside it,
+            # track positions are in crop-space.  raw display coords =
+            # crop_space + (ox, oy).  canvas coords = raw + (0, extra_top).
+            dpx2 = px + ox
+            dpy2 = py + oy + frame_oy
+            alpha = max(0.3, 1.0 - track.ghost_count / max(1, ROBOT_TRACK_LOSS_OK))
+            dc = tuple(int(ch * alpha) for ch in c)
+            cv2.circle(canvas, (dpx2, dpy2), 10, dc, 2, cv2.LINE_AA)
+            cv2.putText(canvas, str(sid), (dpx2 + 12, dpy2 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, dc, 1, cv2.LINE_AA)
+
+        # ── Draw confirmed boxes from this session ────────────────────────
+        for prev_sid, (pcx, pcy) in result.items():
+            c = _SLOT_COLORS[prev_sid % len(_SLOT_COLORS)]
+            px = pcx + ox
+            py = pcy + oy + frame_oy
+            cv2.circle(canvas, (px, py), 8, c, -1, cv2.LINE_AA)
+            cv2.putText(canvas, f"✓{prev_sid}", (px + 10, py - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
+
+        # ── Draw "absent" labels ──────────────────────────────────────────
+        for ai, asid in enumerate(absent):
+            c = _SLOT_COLORS[asid % len(_SLOT_COLORS)]
+            cv2.putText(canvas, f"Slot {asid}: NOT IN FRAME",
+                        (10, frame_oy + 20 + ai * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
+
+        # ── Draw the in-progress drag box ─────────────────────────────────
+        if state["box_start"] and state["box_end"]:
+            bx1 = min(state["box_start"][0], state["box_end"][0])
+            by1 = min(state["box_start"][1], state["box_end"][1]) + frame_oy
+            bx2 = max(state["box_start"][0], state["box_end"][0])
+            by2 = max(state["box_start"][1], state["box_end"][1]) + frame_oy
+            # Filled semi-transparent highlight
+            overlay = canvas.copy()
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
+            cv2.addWeighted(overlay, 0.25, canvas, 0.75, 0, canvas)
+            # Solid border
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), color, 2, cv2.LINE_AA)
+            # Centre crosshair
+            cx = (bx1 + bx2) // 2
+            cy = (by1 + by2) // 2
+            cv2.drawMarker(canvas, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
+            # Size label
+            cv2.putText(canvas, f"{bx2-bx1}×{by2-by1}", (bx1, by1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+        # ── Top banner ────────────────────────────────────────────────────
+        cv2.rectangle(canvas, (0, 0), (w, self._BANNER_H), (18, 18, 18), -1)
+        title = prompt or "ROBOT RE-IDENTIFICATION"
+        cv2.putText(canvas, title, (8, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 1, cv2.LINE_AA)
+        slot_info = (f"Slot {slot_id}  ({current_idx + 1}/{len(slot_ids)})  "
+                     f": draw a box, then click Confirm.  "
+                     f"{'[BOX READY]' if state['box_start'] and state['box_end'] else '[NO BOX]'}")
+        cv2.putText(canvas, slot_info, (8, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+        # Slot colour swatch
+        cv2.circle(canvas, (w - 22, self._BANNER_H // 2), 14, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (w - 22, self._BANNER_H // 2), 14, (255, 255, 255), 1)
+
+        # ── Bottom button bar ─────────────────────────────────────────────
+        btn_area_y = canvas_h - self._BTN_H
+        cv2.rectangle(canvas, (0, btn_area_y), (w, canvas_h), (25, 25, 25), -1)
+        all_resolved = all((s in result or s in absent) for s in slot_ids)
+        btn_rects    = self._button_rects(base_frame)
+        for i, (label, _, bg, fg) in enumerate(self._BTNS):
+            bx1, by1, bx2, by2 = btn_rects[i]
+            # "Confirm" is greyed if no box yet
+            if "Confirm" in label and not (state["box_start"] and state["box_end"]):
+                bg = (45, 45, 45)
+                fg = (90, 90, 90)
+            # "Done" is greyed until all slots resolved
+            if "Done" in label and not all_resolved:
+                bg = (45, 45, 45)
+                fg = (90, 90, 90)
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), bg, -1)
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (80, 80, 80), 1)
+            # Centre the text in the button
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+            tx = bx1 + (bx2 - bx1 - tw) // 2
+            ty = by1 + (by2 - by1 + th) // 2
+            cv2.putText(canvas, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, fg, 1, cv2.LINE_AA)
+
+        return canvas
+
+    # ------------------------------------------------------------------
+    def apply_assignments(self, assignments: dict, frame_idx: int) -> None:
+        """Force-feed crop-space centre positions into the Kalman filters."""
+        if not assignments:
+            return
+        for slot_id, (cx, cy) in assignments.items():
+            track = self._rt.tracks.get(slot_id)
+            if track is None:
+                continue
+            track.kf.statePost = np.array(
+                [[float(cx)], [float(cy)], [0.0], [0.0]], dtype=np.float32
+            )
+            track.kf.errorCovPost = np.eye(4, dtype=np.float32) * 100.0
+            track.ghost_count = 0
+            track.initialized = True
+            track.trail.append((cx, cy))
+            track.perma_path.append((cx, cy, frame_idx))
+            print(f"  [RobotID] Slot {slot_id} Kalman reset to crop ({cx},{cy})")
+
+    # ------------------------------------------------------------------
+    def _draw_all_robots(self, frame: np.ndarray, ox: int, oy: int) -> None:
+        """Draw all initialized robot positions in display-frame coords."""
+        for slot_id, track in self._rt.tracks.items():
+            if not track.initialized:
+                continue
+            color  = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
+            px, py = track.position()
+            dpx, dpy = px + ox, py + oy
+            alpha  = max(0.3, 1.0 - track.ghost_count / max(1, ROBOT_TRACK_LOSS_OK))
+            dc     = tuple(int(c * alpha) for c in color)
+            cv2.circle(frame, (dpx, dpy), 12, dc, 2, cv2.LINE_AA)
+            if track.last_box is not None:
+                x1, y1, x2, y2 = track.last_box
+                cv2.rectangle(frame, (x1 + ox, y1 + oy), (x2 + ox, y2 + oy), dc, 1)
+            cv2.putText(frame, str(slot_id), (dpx + 14, dpy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, dc, 2, cv2.LINE_AA)
+
+
+def _canvas_h(frame: np.ndarray) -> int:
+    """Total canvas height = frame height + banner + button bar."""
+    return frame.shape[0] + RobotIDUI._BANNER_H + RobotIDUI._BTN_H
 
 
 
@@ -211,7 +596,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
         f"hole={hole_region} score={score_polygon} active={active_region}"
     )
 
-    tracker    = Tracker()
+    tracker       = Tracker()
+    robot_tracker = RobotTracker()
     trails     = defaultdict(list)
     t_alphas   = defaultdict(list)
     full_trails = defaultdict(list)  # unbounded, no decay — used for scored snapshots
@@ -233,6 +619,12 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
     shot_robot_map: dict = {}
 
     stitcher        = PathStitcher()
+    robot_id_ui     = RobotIDUI(robot_tracker)   # re-identification UI
+    _startup_done   = False   # flag: we still need to run the startup ID prompt
+    _lost_prompted  = set()   # slot IDs already prompted this loss episode
+    # Consecutive-frame counter for each slot being lost; triggers Re-ID once
+    # it crosses ROBOT_TRACK_LOSS_OK.  Reset when the slot is re-found.
+    _loss_frame_counts: dict = {i: 0 for i in range(NUM_ROBOTS)}
     fps_window      = 30
     frame_times     = []
     display_fps     = 0.0
@@ -277,6 +669,60 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
         live, dormant = robot_tracker.update(robot_dets, crop_frame=frame)
         frame = robot_tracker.draw(frame)
         t_rtrack = time.perf_counter()
+
+        # ── Robot re-identification UI ─────────────────────────────────────
+        # 1) STARTUP — always shown on the very first processed frame so the
+        #    operator can draw boxes for all 6 slots before playback begins.
+        if not _startup_done:
+            all_ids = list(range(NUM_ROBOTS))
+            print(f"  [RobotID] Startup: prompting for all {NUM_ROBOTS} slots")
+            assignments = robot_id_ui.run(
+                raw_frame, (crop_x, crop_y), all_ids,
+                prompt="STARTUP: draw a box around each robot to seed tracking.",
+            )
+            # None means the user pressed ESC/abort — skip seeding but mark done
+            if assignments:
+                robot_id_ui.apply_assignments(assignments, frame_idx)
+            _startup_done = True
+            _lost_prompted.clear()
+            # Reset loss counters after startup
+            for k in _loss_frame_counts:
+                _loss_frame_counts[k] = 0
+
+        # 2) Update per-slot loss counters.
+        #    A slot counts as "lost" if it is initialized but ghost_count > 0,
+        #    OR if it has never been initialized at all (never seen by YOLO and
+        #    not seeded at startup).
+        for tid, track in robot_tracker.tracks.items():
+            if not track.initialized or track.ghost_count > 0:
+                _loss_frame_counts[tid] += 1
+            else:
+                # Slot is alive — reset its counter and clear any prior prompt flag
+                if _loss_frame_counts[tid] > 0:
+                    _loss_frame_counts[tid] = 0
+                _lost_prompted.discard(tid)
+
+        # 3) TRACK-LOSS — trigger when ≥1 slot has been continuously lost for
+        #    ROBOT_TRACK_LOSS_OK frames and hasn't already been prompted this
+        #    loss episode.
+        newly_lost = [
+            tid for tid, cnt in _loss_frame_counts.items()
+            if cnt >= ROBOT_TRACK_LOSS_OK and tid not in _lost_prompted
+        ]
+        if newly_lost:
+            print(f"  [RobotID] Track loss threshold reached for slots {newly_lost} "
+                  f"(counts: {[_loss_frame_counts[t] for t in newly_lost]})")
+            assignments = robot_id_ui.run(
+                raw_frame, (crop_x, crop_y), newly_lost,
+                prompt=(
+                    f"TRACKING LOST — slot(s) {newly_lost} missing for "
+                    f">={ROBOT_TRACK_LOSS_OK} frames.  Draw a box (or 'Not in frame')."
+                ),
+            )
+            if assignments is not None:   # None = user aborted
+                robot_id_ui.apply_assignments(assignments, frame_idx)
+            # Mark all prompted so we don't spam the dialog every frame
+            _lost_prompted.update(newly_lost)
 
         for oid, (x, y) in objects.items():
             track = tracker.tracks.get(oid)
@@ -439,9 +885,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
         for shot_idx, (oid, (trail_pts, cpts)) in enumerate(scored_curves.items(), start=1):
             # Color the trail by which robot shot it (slot color) or orange if unattributed
             r_slot = shot_robot_map.get(oid)
-            from robot_tracker import _SLOT_COLORS
             shot_color = _SLOT_COLORS[r_slot % len(_SLOT_COLORS)] if r_slot is not None \
-                         else (0, 165, 255)
+                else (0, 165, 255)
             for i in range(1, len(trail_pts)):
                 cv2.line(vis, trail_pts[i - 1], trail_pts[i], shot_color, 2, cv2.LINE_AA)
             mid = trail_pts[len(trail_pts) // 2]
@@ -449,7 +894,6 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, shot_color, 1, cv2.LINE_AA)
 
         # ── Robot score labels next to each live robot box ─────────────────
-        from robot_tracker import _SLOT_COLORS
         for slot_id, track in robot_tracker.tracks.items():
             if not track.initialized:
                 continue
@@ -605,8 +1049,6 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
     return score
 
 
-
-robot_tracker = RobotTracker()
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Track")
     parser.add_argument("--side", type=str, choices=["red", "blue"], default="red")

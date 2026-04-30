@@ -38,6 +38,7 @@ try:
         ROBOT_MAX_TRAIL,
         ROBOT_PROCESS_NOISE,
         ROBOT_MEASUREMENT_NOISE,
+        ROBOT_TRACK_LOSS_OK,
     )
 except ImportError:
     ROBOT_MAX_DIST          = 60
@@ -47,6 +48,7 @@ except ImportError:
     ROBOT_MAX_TRAIL         = 60
     ROBOT_PROCESS_NOISE     = 5e-2
     ROBOT_MEASUREMENT_NOISE = 0.5
+    ROBOT_TRACK_LOSS_OK     = 45
 
 NUM_ROBOTS = 6
 
@@ -234,8 +236,8 @@ def _infer_alliance(frame: np.ndarray, x1, y1, x2, y2) -> str:
         return "unknown"
     hsv       = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     red_mask  = (
-        cv2.inRange(hsv, (0,   150, 80), (15,  255, 255)) |
-        cv2.inRange(hsv, (165, 150, 80), (180, 255, 255))
+            cv2.inRange(hsv, (0,   150, 80), (15,  255, 255)) |
+            cv2.inRange(hsv, (165, 150, 80), (180, 255, 255))
     )
     blue_mask = cv2.inRange(hsv, (100, 180, 100), (115, 255, 210))
     red_px    = int(cv2.countNonZero(red_mask))
@@ -409,8 +411,22 @@ class RobotTracker:
         for tid, track in self.tracks.items():
             if tid not in matched_ids and track.initialized:
                 track.ghost_count += 1
+                # Extrapolate perma_path forward using the Kalman-predicted
+                # position so attribution can still reach the ball even when
+                # YOLO has lost the robot.  We only do this while ghosted so
+                # we don't double-append on matched frames.
+                px, py = track.position()
+                track.perma_path.append((px, py, self._frame_idx))
 
         return dict(self.tracks), {}
+
+    # ------------------------------------------------------------------
+    def get_track_loss_info(self) -> List[int]:
+        """Return slot IDs that have been continuously lost > ROBOT_TRACK_LOSS_OK frames."""
+        return [
+            tid for tid, t in self.tracks.items()
+            if t.initialized and t.ghost_count > ROBOT_TRACK_LOSS_OK
+        ]
 
     # ------------------------------------------------------------------
     def draw(self, frame: np.ndarray) -> np.ndarray:
@@ -424,7 +440,7 @@ class RobotTracker:
             is_ghost   = track.ghost_count > 0
 
             alpha = max(0.25, 1.0 - track.ghost_count / (ROBOT_GHOST_FRAMES + 1)) \
-                    if is_ghost else 1.0
+                if is_ghost else 1.0
             draw_color = tuple(int(c * alpha) for c in slot_color)
 
             # ── Permanent path (thin, fades from old → new) ───────────────

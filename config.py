@@ -46,6 +46,11 @@ ID_SCORE_COOLDOWN_FRAMES = 10
 GHOST_FRAMES = 8
 FRAME_SKIP   = 2
 
+# How many consecutive frames a robot may be lost (ghost) before the system
+# pauses and asks the user to re-identify it.  Set to a large number to
+# disable the prompt (e.g. 9999).
+ROBOT_TRACK_LOSS_OK     = 45   # frames (~1.5 s at 30 fps)
+
 ROBOT_MAX_DIST          = 60
 ROBOT_GHOST_FRAMES      = 12
 ROBOT_DORMANT_FRAMES    = 60
