@@ -492,12 +492,12 @@ def polygon_center(polygon):
     return (np.mean(xs), np.mean(ys))
 
 
-def adjust_polygon_for_apriltag(video_path, side, frame_240_offset=None):
+def adjust_polygon_for_apriltag(frame,side, frame_240_offset=None):
     if frame_240_offset is None:
         try:
-            ref_cap = cv2.VideoCapture("Q18.mp4")
-            ref_frame = get_frame_at_index(ref_cap, 240)
-            ref_cap.release()
+
+
+            ref_frame=frame
 
             if ref_frame is not None:
                 apriltags = detect_apriltags(ref_frame)
@@ -528,9 +528,7 @@ def adjust_polygon_for_apriltag(video_path, side, frame_240_offset=None):
         return None
 
     try:
-        cap = cv2.VideoCapture(video_path)
-        frame = get_frame_at_index(cap, 240)
-        cap.release()
+
 
         if frame is None:
             print("[AprilTag] Could not read frame 240 from video")
@@ -579,10 +577,15 @@ def adjust_polygon_for_apriltag(video_path, side, frame_240_offset=None):
         print(f"[AprilTag] Error adjusting polygon: {e}")
         return None
 
-def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
+def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
     cap = cv2.VideoCapture(video_path)
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+
+    ref_frame = get_frame_at_index(cap, 240)
+
+    adjust_polygon_for_apriltag(ref_frame,side)
     if frame_w <= 0 or frame_h <= 0:
         raise RuntimeError("Could not read input video dimensions")
 
@@ -644,6 +647,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=0):
 
         if frame_idx < skip_frames:
             continue
+
+
 
         t_start = time.perf_counter()
 
@@ -1063,5 +1068,7 @@ if __name__ == "__main__":
     frame_skip = args.frame_drop if args.frame_drop is not None else FRAME_SKIP
 
     print("Initializing...")
+
+
     sc = run(args.video_file, args.side, frame_skip=frame_skip, max_stale_frames=args.max_stale_frames)
     print(f"Final score: {sc}")

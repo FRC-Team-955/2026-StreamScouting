@@ -433,7 +433,7 @@ def detect(frame: np.ndarray, max_stale_frames: int = 0) -> list:
     if max_stale_frames > 0:
         if _dispatch_seq - seq_before > max_stale_frames:
             while True:
-                _result_ready.wait(timeout=0.005)
+                _result_ready.wait(timeout=0.05)
                 _result_ready.clear()
                 with _result_lock:
                     if _result_seq > seq_before:
