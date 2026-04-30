@@ -123,23 +123,32 @@ class RobotIDUI:
             if s is None:          # callback disabled between slots — ignore
                 return
             s["mouse_pos"] = (x, y)
-            # Ignore events inside the button bar or banner
-            h_total = _canvas_h(display_frame)
-            btn_top = h_total - self._BTN_H
+            h_total  = _canvas_h(display_frame)
+            btn_top  = h_total - self._BTN_H
             frame_oy = self._BANNER_H
-            if y >= btn_top or y <= self._BANNER_H:
+
+            # Frame-local y = canvas y minus the banner height.
+            # Clamped so the box is always inside the image area.
+            frame_y = max(0, min(y - frame_oy, display_frame.shape[0] - 1))
+
+            # Events in the banner or button bar → handle as button clicks only
+            in_chrome = (y <= frame_oy) or (y >= btn_top)
+            if in_chrome:
                 if event == cv2.EVENT_LBUTTONDOWN:
                     self._handle_btn_click(x, y, display_frame, s)
-                s["dragging"] = False
+                # Never start or continue a drag in chrome areas
+                if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_LBUTTONUP):
+                    s["dragging"] = False
                 return
+
             if event == cv2.EVENT_LBUTTONDOWN:
-                s["box_start"] = (x, y - frame_oy)
-                s["box_end"]   = (x, y - frame_oy)
+                s["box_start"] = (x, frame_y)
+                s["box_end"]   = (x, frame_y)
                 s["dragging"]  = True
             elif event == cv2.EVENT_MOUSEMOVE and s["dragging"]:
-                s["box_end"] = (x, y - frame_oy)
+                s["box_end"] = (x, frame_y)
             elif event == cv2.EVENT_LBUTTONUP and s["dragging"]:
-                s["box_end"]  = (x, y - frame_oy)
+                s["box_end"]  = (x, frame_y)
                 s["dragging"] = False
             elif event == cv2.EVENT_RBUTTONDOWN:
                 # Right-click clears the current box
@@ -151,7 +160,9 @@ class RobotIDUI:
         current_idx = 0
         while current_idx < len(slot_ids):
             slot_id = slot_ids[current_idx]
-            label = f"{'RED' if slot_id < 3 else 'BLUE'}{slot_id % 3 + 1}"
+            alliance_cap = "Red" if slot_id < 3 else "Blue"
+            alliance_num = (slot_id % 3) + 1
+            label = f"{alliance_cap} {alliance_num}"   # e.g. "Red 1", "Blue 3"
             color   = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
 
             # Reset shared state for this slot; keep _cb_state[0] pointing at it
@@ -297,16 +308,14 @@ class RobotIDUI:
                 continue
             c = _SLOT_COLORS[sid % len(_SLOT_COLORS)]
             px, py = track.position()
-            dpx, dpy = px + ox + 0, py + oy + frame_oy  # raw display → canvas
-            # Shift: display_frame is the raw_frame, crop is inside it,
-            # track positions are in crop-space.  raw display coords =
-            # crop_space + (ox, oy).  canvas coords = raw + (0, extra_top).
             dpx2 = px + ox
             dpy2 = py + oy + frame_oy
             alpha = max(0.3, 1.0 - track.ghost_count / max(1, ROBOT_TRACK_LOSS_OK))
             dc = tuple(int(ch * alpha) for ch in c)
             cv2.circle(canvas, (dpx2, dpy2), 10, dc, 2, cv2.LINE_AA)
-            cv2.putText(canvas, str(sid), (dpx2 + 12, dpy2 - 6),
+            sid_alliance_cap = track.alliance.capitalize()
+            sid_num          = (sid % 3) + 1
+            cv2.putText(canvas, f"{sid_alliance_cap} {sid_num}", (dpx2 + 12, dpy2 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, dc, 1, cv2.LINE_AA)
 
         # ── Draw confirmed boxes from this session ────────────────────────
@@ -315,7 +324,7 @@ class RobotIDUI:
             px = pcx + ox
             py = pcy + oy + frame_oy
             cv2.circle(canvas, (px, py), 8, c, -1, cv2.LINE_AA)
-            cv2.putText(canvas, f"✓{label}", (px + 10, py - 6),
+            cv2.putText(canvas, f"OK {label}", (px + 10, py - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
 
         # ── Draw "absent" labels ──────────────────────────────────────────
@@ -342,19 +351,19 @@ class RobotIDUI:
             cy = (by1 + by2) // 2
             cv2.drawMarker(canvas, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
             # Size label
-            cv2.putText(canvas, f"{bx2-bx1}×{by2-by1}", (bx1, by1 - 4),
+            cv2.putText(canvas, f"{bx2-bx1}x{by2-by1}", (bx1, by1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
         # ── Top banner ────────────────────────────────────────────────────
         cv2.rectangle(canvas, (0, 0), (w, self._BANNER_H), (18, 18, 18), -1)
         title = prompt or "ROBOT RE-IDENTIFICATION"
         cv2.putText(canvas, title, (8, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.82, (0, 220, 255), 1, cv2.LINE_AA)
         slot_info = (f"{label}  ({current_idx + 1}/{len(slot_ids)})  "
                      f": draw a box, then click Confirm.  "
                      f"{'[BOX READY]' if state['box_start'] and state['box_end'] else '[NO BOX]'}")
         cv2.putText(canvas, slot_info, (8, 38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, color, 1, cv2.LINE_AA)
         # Slot colour swatch
         cv2.circle(canvas, (w - 22, self._BANNER_H // 2), 14, color, -1, cv2.LINE_AA)
         cv2.circle(canvas, (w - 22, self._BANNER_H // 2), 14, (255, 255, 255), 1)
@@ -419,7 +428,9 @@ class RobotIDUI:
             if track.last_box is not None:
                 x1, y1, x2, y2 = track.last_box
                 cv2.rectangle(frame, (x1 + ox, y1 + oy), (x2 + ox, y2 + oy), dc, 1)
-            cv2.putText(frame, str(slot_id), (dpx + 14, dpy - 8),
+            alliance_cap = track.alliance.capitalize()
+            alliance_num = (slot_id % 3) + 1
+            cv2.putText(frame, f"{alliance_cap} {alliance_num}", (dpx + 14, dpy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, dc, 2, cv2.LINE_AA)
 
 
@@ -725,7 +736,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
             assignments = robot_id_ui.run(
                 raw_frame, (crop_x, crop_y), newly_lost,
                 prompt=(
-                    f"TRACKING LOST — slot(s) {newly_lost} missing for "
+                    f"TRACKING LOST slot(s) {newly_lost} missing for "
                     f">={ROBOT_TRACK_LOSS_OK} frames.  Draw a box (or 'Not in frame')."
                 ),
             )
@@ -908,12 +919,9 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
             if not track.initialized:
                 continue
             rs = robot_scores[slot_id]
-            alliance_word = {"red": "RED", "blue": "BLU", "unknown": "UNK"}.get(
-                track.alliance, "UNK")
-            same_alliance = [sid for sid, t in robot_tracker.tracks.items()
-                             if t.alliance == track.alliance and sid <= slot_id]
-            alliance_num  = len(same_alliance)
-            robot_label   = f"{alliance_word} {alliance_num}"
+            alliance_cap = track.alliance.capitalize()
+            alliance_num = (slot_id % 3) + 1
+            robot_label  = f"{alliance_cap} {alliance_num}"
             # Build period breakdown dynamically e.g. "A:2 T:1 E:0"
             period_parts  = " ".join(f"{n[0].upper()}:{rs[n]}" for n, _ in MATCH_PERIODS)
             score_label   = f"{rs['total']}pt  {period_parts}"
@@ -995,11 +1003,10 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
         for row, (slot_id, rs) in enumerate(robot_scores.items()):
             ry = ty + row_h * (row + 2) + 4
             rtrack   = robot_tracker.tracks[slot_id]
-            aw       = {"red":"RED","blue":"BLU","unknown":"UNK"}.get(rtrack.alliance,"UNK")
-            same_al  = [sid for sid,t in robot_tracker.tracks.items()
-                        if t.alliance == rtrack.alliance and sid <= slot_id]
-            anum     = len(same_al)
-            row_label = f"{aw}{anum}"
+            alliance_abbr = {"red": "RED", "blue": "BLU", "unknown": "UNK"}.get(
+                rtrack.alliance, "UNK")
+            anum      = (slot_id % 3) + 1
+            row_label = f"{alliance_abbr}{anum}"   # "RED1", "BLU3" — compact for table
             slot_col  = _SLOT_COLORS[slot_id % len(_SLOT_COLORS)]
 
             cv2.putText(vis, row_label, (tx + 2, ry),
@@ -1043,16 +1050,13 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
     print(f"  {'Robot':<12} {'Total':>5}  {'Auto':>5}  {'Teleop':>6}  {'Endgame':>7}  {'Scaled':>7}")
     for slot_id, rs in robot_scores.items():
         track = robot_tracker.tracks[slot_id]
-        alliance_word = {"red": "RED", "blue": "BLU", "unknown": "UNK"}.get(
-            track.alliance, "UNK")
-        same_alliance = [sid for sid, t in robot_tracker.tracks.items()
-                         if t.alliance == track.alliance and sid <= slot_id]
-        alliance_num  = len(same_alliance)
-        label = f"{alliance_word} {alliance_num} (s{slot_id})"
+        alliance_cap = track.alliance.capitalize()
+        alliance_num = (slot_id % 3) + 1
+        label = f"{alliance_cap} {alliance_num} (s{slot_id})"
         # Scale each robot's score by the tracking factor — gives best estimate
         # of true contribution accounting for missed attributions
         scaled = rs["total"] / tracking_factor if tracking_factor > 0 else 0.0
-        print(f"  {label:<12} {rs['total']:>5}  {rs['auto']:>5}  {rs['teleop']:>6}"
+        print(f"  {label:<16} {rs['total']:>5}  {rs['auto']:>5}  {rs['teleop']:>6}"
               f"  {rs['endgame']:>7}  {scaled:>7.2f}")
     print("=" * 60 + "\n")
 

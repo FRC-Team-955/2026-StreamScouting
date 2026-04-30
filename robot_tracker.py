@@ -210,11 +210,23 @@ class RobotTrack:
             self.alliance = alliance
 
     def update_from_optic_flow(self, cx: int, cy: int, frame_idx: int = 0) -> None:
-        """Soft positional nudge from optical flow — trail only, Kalman predicts freely."""
+        """Soft positional nudge from optical flow — trail only, Kalman predicts freely.
+
+        Skips the append if the position is (0, 0) which is the sentinel value
+        for an untracked / lost feature set and would corrupt the path.
+        """
+        if cx == 0 and cy == 0:
+            return
         self.trail.append((cx, cy))
         self.perma_path.append((cx, cy, frame_idx))
 
     def position(self) -> Tuple[int, int]:
+        # statePost is all-zeros before the first kf.correct() call, which
+        # would cause the trail to snap to (0, 0).  Return None-sentinel so
+        # callers know not to record a position yet.  Every caller that draws
+        # already gates on track.initialized, but this makes it safe regardless.
+        if not self.initialized:
+            return (0, 0)   # caller must check initialized before using
         s = self.kf.statePost
         return int(s[0][0]), int(s[1][0])
 
@@ -413,10 +425,11 @@ class RobotTracker:
                 track.ghost_count += 1
                 # Extrapolate perma_path forward using the Kalman-predicted
                 # position so attribution can still reach the ball even when
-                # YOLO has lost the robot.  We only do this while ghosted so
-                # we don't double-append on matched frames.
+                # YOLO has lost the robot.  Skip if position is (0,0) — that
+                # is the uninitialized sentinel and would corrupt the path.
                 px, py = track.position()
-                track.perma_path.append((px, py, self._frame_idx))
+                if px != 0 or py != 0:
+                    track.perma_path.append((px, py, self._frame_idx))
 
         return dict(self.tracks), {}
 
@@ -480,10 +493,13 @@ class RobotTracker:
             cv2.circle(frame, (cx_dot, cy_dot), 4, draw_color, -1, cv2.LINE_AA)
 
             # ── Label (top-right of box) ──────────────────────────────────
-            g_tag = "G" if is_ghost else ""
-            label = f"{g_tag}{tid}[{track.alliance[0].upper()}]"
+            # "Red 1" / "Blue 3" — number within alliance (1-based), ghost tag
+            alliance_cap = track.alliance.capitalize()
+            alliance_num = (tid % 3) + 1
+            g_tag        = " [G]" if is_ghost else ""
+            label        = f"{alliance_cap} {alliance_num}{g_tag}"
             cv2.putText(frame, label, (br[0] + 3, tl[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, draw_color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, draw_color, 1, cv2.LINE_AA)
 
         return frame
 

@@ -130,7 +130,7 @@ def _run_yolo(frame: np.ndarray) -> list:
     tiles        = [frame[y0:y1, x0:x1] for x0, y0, x1, y1 in tiles_coords]
     raw: list    = []
     for result, (x0, y0, _, _) in zip(
-        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=True),
+        _get_model()(tiles, imgsz=TILE_SIZE, conf=CONF_THRESH, verbose=False, augment=True, device='mps'),
         tiles_coords,
     ):
         if result.boxes is None:
@@ -355,9 +355,16 @@ _yolo_latency_ms: float = 0.0
 _yolo_latency_lock      = threading.Lock()
 _YOLO_EMA_ALPHA: float  = 0.2
 
-_dispatch_seq: int = 0
-_result_seq:   int = 0
-_result_ready       = threading.Event()
+# _dispatch_seq: incremented by detect() on every call (= frames handed in).
+# _result_seq:   incremented by worker on every completed inference.
+# _frames_since_result: how many detect() calls have happened since the last
+#   completed inference — the true "staleness" counter.  Reset to 0 each time
+#   the worker publishes a new result; incremented by detect() each call.
+#   Protected by _result_lock so both reads and writes are consistent.
+_dispatch_seq:        int = 0
+_result_seq:          int = 0
+_frames_since_result: int = 0   # ← THE staleness counter
+_result_ready             = threading.Event()
 
 
 def get_yolo_latency_ms() -> float:
@@ -366,7 +373,8 @@ def get_yolo_latency_ms() -> float:
 
 
 def _worker_loop() -> None:
-    global _pending_frame, _latest_result, _yolo_latency_ms, _result_seq
+    global _pending_frame, _latest_result, _yolo_latency_ms, \
+           _result_seq, _frames_since_result
     while not _stop_event.is_set():
         with _pending_lock:
             frame = _pending_frame
@@ -374,19 +382,20 @@ def _worker_loop() -> None:
             threading.Event().wait(timeout=0.001)
             continue
 
-        t0     = time.perf_counter()
-        raw    = _run_yolo(frame)
-        result = _cap_to_num_robots(raw)
+        t0         = time.perf_counter()
+        raw        = _run_yolo(frame)
+        result     = _cap_to_num_robots(raw)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         with _yolo_latency_lock:
             _yolo_latency_ms = (
-                _YOLO_EMA_ALPHA * elapsed_ms + (1.0-_YOLO_EMA_ALPHA)*_yolo_latency_ms
+                _YOLO_EMA_ALPHA * elapsed_ms + (1.0 - _YOLO_EMA_ALPHA) * _yolo_latency_ms
             ) if _yolo_latency_ms else elapsed_ms
 
         with _result_lock:
-            _latest_result = result
-            _result_seq   += 1
+            _latest_result        = result
+            _result_seq          += 1
+            _frames_since_result  = 0   # worker just delivered — reset staleness
         _result_ready.set()
 
         with _pending_lock:
@@ -413,31 +422,61 @@ def stop_worker() -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
+# Hard cap: if YOLO result is stale for more than this many frames, detect()
+# will block until the worker delivers a fresh inference regardless of the
+# max_stale_frames argument.  Set via config if available.
+try:
+    from config import YOLO_HARD_STALE_FRAMES  # type: ignore
+except ImportError:
+    YOLO_HARD_STALE_FRAMES = 12   # ~0.4 s at 30 fps — tune in config.py
+
+
 def detect(frame: np.ndarray, max_stale_frames: int = 0) -> list:
     """Return up to NUM_ROBOTS (6) YOLO detections — [x1,y1,x2,y2,conf,cls].
 
-    Call of_update_slots() every frame for optical-flow position updates.
-    Call score_detection_vs_slot() + reinit_slot_of() + update_appearance()
-    from robot_tracker after each Hungarian assignment.
+    Staleness behaviour
+    -------------------
+    max_stale_frames > 0  : soft gate — block if the result is older than
+                            this many frames (caller-controlled).
+    YOLO_HARD_STALE_FRAMES: hard gate — always block once the result is this
+                            many frames old, regardless of max_stale_frames.
+                            Prevents the tracker from running forever on a
+                            completely frozen YOLO output.
+
+    Both gates block by sleeping in 5 ms increments until the worker fires.
     """
-    global _pending_frame, _dispatch_seq
+    global _pending_frame, _dispatch_seq, _frames_since_result
     _ensure_worker()
 
+    # Snapshot result_seq *before* queuing so we know what "new" means.
     with _result_lock:
-        seq_before = _result_seq
+        seq_before   = _result_seq
+        stale_now    = _frames_since_result
 
+    # Queue the latest frame for the worker (overwrites any unprocessed one).
     _dispatch_seq += 1
     with _pending_lock:
         _pending_frame = frame.copy()
 
-    if max_stale_frames > 0:
-        if _dispatch_seq - seq_before > max_stale_frames:
-            while True:
-                _result_ready.wait(timeout=0.05)
-                _result_ready.clear()
-                with _result_lock:
-                    if _result_seq > seq_before:
-                        return list(_latest_result)
+    # Increment the staleness counter (worker resets it to 0 when it finishes).
+    with _result_lock:
+        _frames_since_result += 1
+        stale_now = _frames_since_result
+
+    # Determine whether we must block.
+    soft_block = (max_stale_frames > 0) and (stale_now > max_stale_frames)
+    hard_block = stale_now > YOLO_HARD_STALE_FRAMES
+
+    if soft_block or hard_block:
+        # Block until the worker has produced at least one result newer than
+        # the snapshot we took above.
+        _result_ready.clear()
+        while True:
+            _result_ready.wait(timeout=0.005)
+            _result_ready.clear()
+            with _result_lock:
+                if _result_seq > seq_before:
+                    return list(_latest_result)
 
     with _result_lock:
         return list(_latest_result)
