@@ -198,7 +198,7 @@ class RobotIDUI:
                     color, state, result, absent, ox, oy, prompt
                 )
                 cv2.imshow(self._WINDOW, canvas)
-                key = cv2.waitKey(20) & 0xFF
+                key = cv2.waitKey(1) & 0xFF
 
                 if key == 27:                    # ESC → abort
                     state["abort"] = True
@@ -478,7 +478,7 @@ def period_names():
 def attribute_shot(ball_start_frame: int,
                    ball_start_pos: tuple,
                    robot_tracks: dict,
-                   ball_trail: list | None = None,
+                   ball_trailx: list | None = None,
                    alliance: str | None = None) -> int | None:
     """Return the robot slot ID most likely to have fired this ball, or None.
 
@@ -496,6 +496,28 @@ def attribute_shot(ball_start_frame: int,
     ball_trail, if given, is a list of (x, y) points starting at ball_start_frame.
     """
     bx, by = ball_start_pos
+
+
+    xs = np.array([p[0] for p in ball_trailx])
+    ys = np.array([p[1] for p in ball_trailx])
+    ts = np.array([p[2] for p in ball_trailx])
+    if max(xs.max() - xs.min(), ys.max() - ys.min()) < 20:
+                     return
+    params, err = fit_conic(xs, ys)
+    a, b, c, theta = params
+    curve_pts = sample_conic_curve(params, xs, ys, CROP_REF[2], CROP_REF[3])
+
+    mx = xs.min()
+    Mx = xs.max()
+    mt = ts.min()
+    Mt = ts.max()
+
+    ball_trail=[]
+    for (x,y) in curve_pts:
+        t=(Mt-mt)/(Mx-mx) * (x-mx) + mt
+        ball_trail.append((x,y,t))
+
+
 
     def _closest_robot_pos(track, target_frame: int):
         """Return (px, py, dt) for the perma_path point nearest to target_frame."""
@@ -945,7 +967,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
                 _ball_trail = full_trails.get(oid) or list(pts)
                 slot_id = attribute_shot(ball_start_frame, ball_start_pos,
                                          robot_tracker.tracks,
-                                         ball_trail=_ball_trail,
+                                         ball_trailx=_ball_trail,
                                          alliance=side)
                 if slot_id is not None:
                     period = period_for_frame(ball_start_frame, fps, skip_frames)
