@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import cv2
 import numpy as np
+import bisect
 
 from config import (
     FRAME_SKIP,
@@ -473,7 +474,7 @@ def period_names():
 
 def attribute_shot(ball_start_frame: int,
                    ball_start_pos: tuple,
-                   robot_tracks: dict) -> int | None:
+                   robot_tracks: dict, alliance=None) -> int | None:
     """Return the robot slot ID most likely to have fired this ball, or None.
 
     Searches each robot's perma_path for the point whose frame_idx is closest
@@ -489,17 +490,20 @@ def attribute_shot(ball_start_frame: int,
     for slot_id, track in robot_tracks.items():
         if not track.initialized or not track.perma_path:
             continue
+        if alliance and track.alliance != alliance and track.alliance != "unknown":
+            continue
 
         # Binary-search-style: find the perma_path entry closest in time
         # (perma_path is appended in order so frame_idx is monotonically non-decreasing)
-        closest_pt = None
-        closest_dt = float("inf")
-        for pt in track.perma_path:
-            px, py, pfidx = pt
-            dt = abs(pfidx - ball_start_frame)
-            if dt < closest_dt:
-                closest_dt = dt
-                closest_pt = pt
+        frames = [pt[2] for pt in track.perma_path]
+        idx = bisect.bisect_left(frames, ball_start_frame)
+        # check the two neighbors around the insertion point
+        candidates = [i for i in (idx - 1, idx) if 0 <= i < len(track.perma_path)]
+        if not candidates:
+            continue
+        closest_pt = min((track.perma_path[i] for i in candidates),
+                         key=lambda pt: abs(pt[2] - ball_start_frame))
+        closest_dt = abs(closest_pt[2] - ball_start_frame)
 
         if closest_pt is None or closest_dt > ATTRIBUTION_TIME_TOL:
             continue   # no temporally valid sample for this robot
@@ -762,7 +766,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
             track = tracker.tracks.get(oid)
             if track and track.ghost_count == 0:
                 if oid not in first_seen:
-                    first_seen[oid] = (x, y)
+                    first_seen[oid] = (x, y, frame_idx)
                 trails[oid].append((x, y))
                 t_alphas[oid].append(1.0)
                 full_trails[oid].append((x, y))
@@ -820,17 +824,24 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
                 last_score_frame = frame_idx
                 scored_track_ids.add(canon_oid)
                 if canon_oid not in origins and canon_oid in first_seen:
-                    origins[canon_oid] = first_seen[canon_oid]
+                    origins[canon_oid] = first_seen[canon_oid][:2]
 
                 if canon_oid not in scored_curves:
                     trail_snap = list(full_trails.get(oid, []))
                     scored_curves[canon_oid] = (trail_snap, [])
 
                 # ── Attribute this shot to the nearest robot ──────────────
-                ball_start_pos   = full_trails[oid][0] if full_trails.get(oid) else pts[0]
-                ball_start_frame = frame_idx - len(pts) + 1  # approx launch frame
+                if oid in first_seen:
+                    ball_start_pos   = first_seen[oid][:2]
+                    ball_start_frame = first_seen[oid][2]
+                elif full_trails.get(oid):
+                    ball_start_pos   = full_trails[oid][0]
+                    ball_start_frame = frame_idx - len(full_trails[oid]) + 1
+                else:
+                    ball_start_pos   = pts[0]
+                    ball_start_frame = frame_idx - len(pts) + 1
                 slot_id = attribute_shot(ball_start_frame, ball_start_pos,
-                                         robot_tracker.tracks)
+                                         robot_tracker.tracks,alliance=side)
                 if slot_id is not None:
                     period = period_for_frame(ball_start_frame, fps, skip_frames)
                     robot_scores[slot_id]["total"]  += 1
