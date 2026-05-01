@@ -755,6 +755,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
                 robot_id_ui.apply_assignments(assignments, frame_idx)
             # Mark all prompted so we don't spam the dialog every frame
             _lost_prompted.update(newly_lost)
+            for tid in newly_lost:
+                _loss_frame_counts[tid] = 0
 
         for oid, (x, y) in objects.items():
             track = tracker.tracks.get(oid)
