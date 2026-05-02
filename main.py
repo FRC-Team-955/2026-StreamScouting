@@ -482,45 +482,16 @@ def attribute_shot(ball_start_frame: int,
                    alliance: str | None = None) -> int | None:
     """Return the robot slot ID most likely to have fired this ball, or None.
 
-    Strategy (in order of preference):
-    1. Tight window: find the closest robot within ATTRIBUTION_TIME_TOL frames
-       of ball_start_frame that is also within ATTRIBUTION_MAX_DIST px.
-    2. Extrapolation: if no robot qualifies in the tight window, walk forward
-       along the ball's trail (if provided) and for each ball position check
-       whether any robot was within ATTRIBUTION_MAX_DIST at the corresponding
-       frame.  The robot that appears closest across the most trail points wins.
-    3. Wide window: if still unresolved, search each robot's perma_path up to
-       ATTRIBUTION_SEARCH_FRAMES frames away and accept the nearest one.
-
-    perma_path entries are (x, y, frame_idx).
-    ball_trail, if given, is a list of (x, y) points starting at ball_start_frame.
+    Stage 1 — tight window: closest robot within ATTRIBUTION_TIME_TOL frames
+              and ATTRIBUTION_MAX_DIST px of the ball's first-seen position.
+    Stage 2 — parabola extrapolation: fit a conic to the raw trail, sample it,
+              and for each sampled point find the closest robot at that frame.
+              Winner needs >=2 hits and 2x the next-best score.
+    Stage 3 — wide window: relax time tolerance to ATTRIBUTION_SEARCH_FRAMES.
     """
     bx, by = ball_start_pos
 
-
-    xs = np.array([p[0] for p in ball_trailx])
-    ys = np.array([p[1] for p in ball_trailx])
-    ts = np.array([p[2] for p in ball_trailx])
-    if max(xs.max() - xs.min(), ys.max() - ys.min()) < 20:
-                     return
-    params, err = fit_conic(xs, ys)
-    a, b, c, theta = params
-    curve_pts = sample_conic_curve(params, xs, ys, CROP_REF[2], CROP_REF[3])
-
-    mx = xs.min()
-    Mx = xs.max()
-    mt = ts.min()
-    Mt = ts.max()
-
-    ball_trail=[]
-    for (x,y) in curve_pts:
-        t=(Mt-mt)/(Mx-mx) * (x-mx) + mt
-        ball_trail.append((x,y,t))
-
-
-
     def _closest_robot_pos(track, target_frame: int):
-        """Return (px, py, dt) for the perma_path point nearest to target_frame."""
         if not track.perma_path:
             return None
         frames = [pt[2] for pt in track.perma_path]
@@ -533,18 +504,16 @@ def attribute_shot(ball_start_frame: int,
         return best[0], best[1], abs(best[2] - target_frame)
 
     eligible = {
-        slot_id: track
-        for slot_id, track in robot_tracks.items()
-        if track.initialized and track.perma_path
-        and (not alliance or track.alliance in (alliance, "unknown"))
+        sid: t for sid, t in robot_tracks.items()
+        if t.initialized and t.perma_path
+           and (not alliance or t.alliance in (alliance, "unknown"))
     }
     if not eligible:
         return None
 
     # ── Stage 1: tight temporal window ────────────────────────────────────
-    best_slot = None
-    best_dist = float("inf")
-    for slot_id, track in eligible.items():
+    best_slot, best_dist = None, float("inf")
+    for sid, track in eligible.items():
         res = _closest_robot_pos(track, ball_start_frame)
         if res is None:
             continue
@@ -553,46 +522,58 @@ def attribute_shot(ball_start_frame: int,
             continue
         dist = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
         if dist < ATTRIBUTION_MAX_DIST and dist < best_dist:
-            best_dist = dist
-            best_slot = slot_id
-
+            best_dist, best_slot = dist, sid
     if best_slot is not None:
         return best_slot
 
-    # ── Stage 2: trail extrapolation ──────────────────────────────────────
-    # Walk along the ball's trail.  For each (frame, ball_pos) pair check which
-    # robot was closest at that frame.  Accumulate a score per slot (sum of
-    # inverse distances) and return the winner if it is unambiguous.
-    if ball_trail and len(ball_trail) >= 2:
-        slot_scores: dict[int, float] = {sid: 0.0 for sid in eligible}
-        slot_hits:   dict[int, int]   = {sid: 0   for sid in eligible}
+    # ── Stage 2: parabola extrapolation ───────────────────────────────────
+    if ball_trailx and len(ball_trailx) >= PARABOLA_MIN_POINTS:
+        xs = np.array([p[0] for p in ball_trailx], dtype=float)
+        ys = np.array([p[1] for p in ball_trailx], dtype=float)
+        ts = np.array([p[2] for p in ball_trailx], dtype=float)
 
-        for step, (tbx, tby) in enumerate(ball_trail):
-            trail_frame = ball_start_frame + step
-            for slot_id, track in eligible.items():
-                res = _closest_robot_pos(track, trail_frame)
-                if res is None:
-                    continue
-                px, py, dt = res
-                if dt > ATTRIBUTION_SEARCH_FRAMES:
-                    continue
-                dist = ((tbx - px) ** 2 + (tby - py) ** 2) ** 0.5
-                if dist < ATTRIBUTION_MAX_DIST:
-                    slot_scores[slot_id] += 1.0 / (dist + 1.0)
-                    slot_hits[slot_id]   += 1
+        span = max(xs.max() - xs.min(), ys.max() - ys.min())
+        if span >= 20:
+            try:
+                params, err = fit_conic(xs, ys)
+                if err < PARABOLA_FIT_ERROR * 2:
+                    curve_pts = sample_conic_curve(params, xs, ys,
+                                                   CROP_REF[2], CROP_REF[3])
+                    # Map each curve point back to an approximate frame index
+                    # by linear interpolation along the x-axis time mapping.
+                    x_min, x_max = float(xs.min()), float(xs.max())
+                    t_min, t_max = float(ts.min()), float(ts.max())
+                    x_span = max(x_max - x_min, 1.0)
 
-        # Accept if one slot has ≥2 hits and clearly dominates (2× next best)
-        ranked = sorted(slot_scores.items(), key=lambda kv: kv[1], reverse=True)
-        if ranked and ranked[0][1] > 0:
-            top_slot, top_score = ranked[0]
-            runner_score = ranked[1][1] if len(ranked) > 1 else 0.0
-            if slot_hits[top_slot] >= 2 and top_score >= 2.0 * max(runner_score, 1e-9):
-                return top_slot
+                    slot_scores = {sid: 0.0 for sid in eligible}
+                    slot_hits   = {sid: 0   for sid in eligible}
+                    for (cx, cy) in curve_pts:
+                        t_approx = t_min + (cx - x_min) / x_span * (t_max - t_min)
+                        trail_frame = int(round(t_approx))
+                        for sid, track in eligible.items():
+                            res = _closest_robot_pos(track, trail_frame)
+                            if res is None:
+                                continue
+                            px, py, dt = res
+                            if dt > ATTRIBUTION_SEARCH_FRAMES:
+                                continue
+                            dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                            if dist < ATTRIBUTION_MAX_DIST:
+                                slot_scores[sid] += 1.0 / (dist + 1.0)
+                                slot_hits[sid]   += 1
+
+                    ranked = sorted(slot_scores.items(), key=lambda kv: kv[1], reverse=True)
+                    if ranked and ranked[0][1] > 0:
+                        top_sid, top_score = ranked[0]
+                        runner = ranked[1][1] if len(ranked) > 1 else 0.0
+                        if slot_hits[top_sid] >= 2 and top_score >= 2.0 * max(runner, 1e-9):
+                            return top_sid
+            except Exception:
+                pass
 
     # ── Stage 3: wide temporal window ─────────────────────────────────────
-    best_slot = None
-    best_dist = float("inf")
-    for slot_id, track in eligible.items():
+    best_slot, best_dist = None, float("inf")
+    for sid, track in eligible.items():
         res = _closest_robot_pos(track, ball_start_frame)
         if res is None:
             continue
@@ -601,9 +582,7 @@ def attribute_shot(ball_start_frame: int,
             continue
         dist = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
         if dist < ATTRIBUTION_MAX_DIST and dist < best_dist:
-            best_dist = dist
-            best_slot = slot_id
-
+            best_dist, best_slot = dist, sid
     return best_slot
 
 
@@ -890,9 +869,9 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
             if track and track.ghost_count == 0:
                 if oid not in first_seen:
                     first_seen[oid] = (x, y, frame_idx)
-                trails[oid].append((x, y))
+                trails[oid].append((x, y,frame_idx))
                 t_alphas[oid].append(1.0)
-                full_trails[oid].append((x, y))
+                full_trails[oid].append((x, y, frame_idx))
                 if len(trails[oid]) > MAX_TRAIL:
                     trails[oid].pop(0)
                     t_alphas[oid].pop(0)
@@ -932,7 +911,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
                 stitcher._fit_cache.pop(oid, None)
 
         # ── score check (now sees stitched trails) ─────────────────────────
-        for oid, pts in trails.items():
+        for oid, pts3 in trails.items():
+            pts = [(x, y) for (x, y, t) in pts3]
             # Resolve canonical ID in case this oid was a continuation
             canon_oid = stitcher.remap.get(oid, oid)
             track = tracker.tracks.get(oid)
@@ -965,9 +945,10 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
                     ball_start_frame = frame_idx - len(pts) + 1
                 # Pass the full ball trail so attribute_shot can extrapolate
                 _ball_trail = full_trails.get(oid) or list(pts)
+                print(_ball_trail)
                 slot_id = attribute_shot(ball_start_frame, ball_start_pos,
                                          robot_tracker.tracks,
-                                         ball_trailx=_ball_trail,
+                                         ball_trailx=full_trails.get(oid),
                                          alliance=side)
                 if slot_id is not None:
                     period = period_for_frame(ball_start_frame, fps, skip_frames)
@@ -1037,7 +1018,7 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
             cv2.circle(vis, (x, y), 2, (0, 0, 255), -1)
 
         for oid in trails:
-            pts  = trails[oid]
+            pts  = [(x,y) for (x,y,t) in trails[oid]]
             alps = t_alphas[oid]
             for i in range(1, len(pts)):
                 a     = alps[i - 1]
@@ -1098,7 +1079,8 @@ def run(video_path, side, frame_skip=FRAME_SKIP, max_stale_frames=2):
         )
 
         # ── Draw permanently retained scored-shot trails ───────────────────
-        for shot_idx, (oid, (trail_pts, cpts)) in enumerate(scored_curves.items(), start=1):
+        for shot_idx, (oid, (trail_ptsq, cpts)) in enumerate(scored_curves.items(), start=1):
+            trail_pts = [(x,y) for (x,y,t) in trail_ptsq]
             # Color the trail by which robot shot it (slot color) or orange if unattributed
             r_slot = shot_robot_map.get(oid)
             shot_color = _SLOT_COLORS[r_slot % len(_SLOT_COLORS)] if r_slot is not None \
